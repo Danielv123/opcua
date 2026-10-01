@@ -223,6 +223,28 @@ func TestClientAsymmetricChunkValidation(t *testing.T) {
 					}
 				})
 			}
+
+			// a block that fails to decrypt is reported like an invalid signature.
+			corrupt := func(offset func(b []byte) int) func(t *testing.T) []byte {
+				return func(t *testing.T) []byte {
+					b := mustEncode(t, valid())
+					b[offset(b)] ^= 0x01
+					return b
+				}
+			}
+			securityFailures := map[string]func(t *testing.T) []byte{
+				"InvalidSignature":    invalid["InvalidSignature"],
+				"CorruptedFirstBlock": corrupt(func(b []byte) int { return asymmetricHeaderSize(valid()) + 10 }),
+				"CorruptedLastBlock":  corrupt(func(b []byte) int { return len(b) - kp.client.key.Size() + 10 }),
+			}
+			for failureName, chunk := range securityFailures {
+				t.Run(name+"/"+failureName+"/SameError", func(t *testing.T) {
+					ch, peer := newChannel(t)
+					if _, status := readTestResponse(t, ch, peer, chunk(t)); status != ua.BadSecurityChecksFailed {
+						t.Fatalf("readResponse() = %v, want %v", status, ua.BadSecurityChecksFailed)
+					}
+				})
+			}
 		}
 	}
 
@@ -483,7 +505,12 @@ func TestClientAbortChunk(t *testing.T) {
 		})
 		t.Run(cfg.mode.String()+"/TruncatedAbort", func(t *testing.T) {
 			ch, peer, c := newChannel(t)
-			for _, b := range [][]byte{setMessageSize(chunk(c, ua.MessageTypeAbort, 2, 9, abort)[:16]), chunk(c, ua.MessageTypeAbort, 2, 9, abort[:2])} {
+			truncated := [][]byte{
+				setMessageSize(chunk(c, ua.MessageTypeAbort, 2, 9, abort)[:16]), // no sequence header, body or signature
+				chunk(c, ua.MessageTypeAbort, 2, 9, abort[:2]),                  // truncated error
+				chunk(c, ua.MessageTypeAbort, 2, 9, abort[:4]),                  // no reason
+			}
+			for _, b := range truncated {
 				if _, status := readTestResponse(t, ch, peer, b); status == ua.Good {
 					t.Fatal("readResponse succeeded")
 				}

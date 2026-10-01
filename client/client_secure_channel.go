@@ -1559,18 +1559,16 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 				}
 
 				// decrypt with local private key. All blocks are decrypted and the signature is verified
-				// even if a block fails to decrypt, and decryption and verification failures are reported
-				// alike, so the result does not reveal whether a block was correctly padded.
+				// even if a block fails to decrypt (see DecryptBlock), and decryption and verification
+				// failures are reported alike, so the result does not reveal whether a block was correctly padded.
 				decrypted := true
 				cipherText := make([]byte, cipherTextBlockSize)
+				plainText := make([]byte, plainTextBlockSize)
 				jj := plainHeaderSize
 				for ii := plainHeaderSize; ii < count; ii += cipherTextBlockSize {
 					copy(cipherText, receiveBuffer[ii:ii+cipherTextBlockSize])
-					plainText, err := ch.securityPolicy.RSADecrypt(ch.localPrivateKey, cipherText)
-					if err != nil || len(plainText) != plainTextBlockSize {
-						decrypted = false
-						plainText = make([]byte, plainTextBlockSize)
-					}
+					ok := securechannel.DecryptBlock(ch.securityPolicy, ch.localPrivateKey, cipherText, plainText)
+					decrypted = decrypted && ok
 					jj += copy(receiveBuffer[jj:], plainText)
 				}
 
@@ -1633,6 +1631,10 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 			abortDecoder := ua.NewBinaryDecoder(bytes.NewReader(receiveBuffer[bodyStart:bodyEnd]), ch)
 			var statusCode uint32
 			if err := abortDecoder.ReadUInt32(&statusCode); err != nil {
+				return nil, ua.BadDecodingError
+			}
+			var reason string
+			if err := abortDecoder.ReadString(&reason); err != nil {
 				return nil, ua.BadDecodingError
 			}
 			result := ua.StatusCode(statusCode)

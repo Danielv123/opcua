@@ -128,6 +128,28 @@ func TestServerAsymmetricChunkValidation(t *testing.T) {
 					}
 				})
 			}
+
+			// a block that fails to decrypt is reported like an invalid signature.
+			corrupt := func(offset func(b []byte) int) func(t *testing.T) []byte {
+				return func(t *testing.T) []byte {
+					b := mustEncode(t, valid())
+					b[offset(b)] ^= 0x01
+					return b
+				}
+			}
+			securityFailures := map[string]func(t *testing.T) []byte{
+				"InvalidSignature":    invalid["InvalidSignature"],
+				"CorruptedFirstBlock": corrupt(func(b []byte) int { return asymmetricHeaderSize(valid()) + 10 }),
+				"CorruptedLastBlock":  corrupt(func(b []byte) int { return len(b) - kp.server.key.Size() + 10 }),
+			}
+			for failureName, chunk := range securityFailures {
+				t.Run(name+"/"+failureName+"/SameError", func(t *testing.T) {
+					ch, peer := newTestServerChannel(t, kp.server)
+					if _, _, err := readTestRequest(t, ch, peer, chunk(t)); err != ua.BadSecurityChecksFailed {
+						t.Fatalf("readRequest() = %v, want %v", err, ua.BadSecurityChecksFailed)
+					}
+				})
+			}
 		}
 	}
 

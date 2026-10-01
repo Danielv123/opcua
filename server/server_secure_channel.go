@@ -1315,18 +1315,16 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 				}
 
 				// decrypt with local private key. All blocks are decrypted and the signature is verified
-				// even if a block fails to decrypt, and decryption and verification failures are reported
-				// alike, so the result does not reveal whether a block was correctly padded.
+				// even if a block fails to decrypt (see DecryptBlock), and decryption and verification
+				// failures are reported alike, so the result does not reveal whether a block was correctly padded.
 				decrypted := true
 				cipherText := make([]byte, cipherTextBlockSize)
+				plainText := make([]byte, plainTextBlockSize)
 				jj := plainHeaderSize
 				for ii := plainHeaderSize; ii < count; ii += cipherTextBlockSize {
 					copy(cipherText, ch.receiveBuffer[ii:ii+cipherTextBlockSize])
-					plainText, err := ch.securityPolicy.RSADecrypt(ch.localPrivateKey, cipherText)
-					if err != nil || len(plainText) != plainTextBlockSize {
-						decrypted = false
-						plainText = make([]byte, plainTextBlockSize)
-					}
+					ok := securechannel.DecryptBlock(ch.securityPolicy, ch.localPrivateKey, cipherText, plainText)
+					decrypted = decrypted && ok
 					jj += copy(ch.receiveBuffer[jj:], plainText)
 				}
 
