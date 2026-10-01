@@ -322,6 +322,35 @@ func TestSecureChannelRejectsMalformedMessageChunk(t *testing.T) {
 	}
 }
 
+// TestSecureChannelRejectsReplayedMessage opens a secure channel, sends a message and then replays it,
+// and checks that the server does not process the replayed message and remains available (issue #6).
+func TestSecureChannelRejectsReplayedMessage(t *testing.T) {
+	endpointURL := hardeningServerURL(t)
+	for _, mode := range []ua.MessageSecurityMode{ua.MessageSecurityModeSign, ua.MessageSecurityModeSignAndEncrypt} {
+		t.Run(mode.String(), func(t *testing.T) {
+			ch := openRawSecureChannel(t, endpointURL, mode)
+			msg := ch.message(2).Encode()
+			if _, err := ch.conn.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+			expectResponse(t, ch.conn)
+			// a later message is answered.
+			if _, err := ch.conn.Write(ch.message(3).Encode()); err != nil {
+				t.Fatal(err)
+			}
+			expectResponse(t, ch.conn)
+			// the replayed message is rejected.
+			if _, err := ch.conn.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+			if code := expectRejected(t, ch.conn); code == ua.Good {
+				t.Errorf("got %v, want an error", code)
+			}
+			checkServerAvailable(t, endpointURL)
+		})
+	}
+}
+
 // TestSecureChannelRejectsNonRSACertificate sends an OpenSecureChannel request with an ECDSA
 // certificate, and checks that the server rejects it and remains available (issue #1).
 func TestSecureChannelRejectsNonRSACertificate(t *testing.T) {

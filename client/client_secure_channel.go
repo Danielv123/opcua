@@ -110,6 +110,7 @@ type clientSecureChannel struct {
 	closing                    bool
 	requestHandle              uint32
 	sequenceNumber             uint32
+	remoteSequenceNumber       securechannel.SequenceNumberValidator
 	sendingTokenID             uint32
 	receivingTokenID           uint32
 	localSigningKey            []byte
@@ -447,6 +448,7 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 	ch.tokenID = 0
 	ch.sendingTokenID = 0
 	ch.receivingTokenID = 0
+	ch.remoteSequenceNumber = securechannel.SequenceNumberValidator{}
 
 	go ch.responseWorker()
 
@@ -1614,6 +1616,11 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 		}
 		if err := decoder.ReadUInt32(&requestID); err != nil {
 			return nil, ua.BadDecodingError
+		}
+		// reject replayed, reordered or missing chunks. The sequence numbers are shared by all
+		// messages of the channel, and only checked once the chunk has been verified.
+		if err := ch.remoteSequenceNumber.Validate(sequenceNumber); err != nil {
+			return nil, ua.BadSequenceNumberInvalid
 		}
 		// all chunks of a message have the same request id.
 		if chunkCount > 1 && requestID != id {

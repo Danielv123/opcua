@@ -66,6 +66,7 @@ type serverSecureChannel struct {
 	sendingSemaphore            sync.Mutex
 	receivingSemaphore          sync.Mutex
 	lastSequenceNumber          uint32
+	remoteSequenceNumber        securechannel.SequenceNumberValidator
 	pendingTokenID              uint32
 	pendingTokenExpiration      time.Time
 	tokenID                     uint32
@@ -1373,6 +1374,11 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 		}
 		if err := decoder.ReadUInt32(&requestID); err != nil {
 			return nil, 0, ua.BadDecodingError
+		}
+		// reject replayed, reordered or missing chunks. The sequence numbers are shared by all
+		// messages of the channel, and only checked once the chunk has been verified.
+		if err := ch.remoteSequenceNumber.Validate(sequenceNumber); err != nil {
+			return nil, 0, err
 		}
 		// all chunks of a message have the same request id.
 		if chunkCount > 1 && requestID != id {
