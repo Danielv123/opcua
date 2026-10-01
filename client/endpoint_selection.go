@@ -359,7 +359,9 @@ func sameLeafCertificate(a, b ua.ByteString) bool {
 	return ca[0].Equal(cb[0])
 }
 
-// sameUserTokenPolicies returns true if the lists contain the same user token policies, in any order.
+// sameUserTokenPolicies returns true if the lists contain the same user token policies, in any order,
+// except that the first IssuedToken policy must have the same IssuedTokenType and IssuerEndpointURL,
+// since it determines the issued token policies the client considers (see selectUserTokenPolicy).
 func sameUserTokenPolicies(a, b []ua.UserTokenPolicy) bool {
 	if len(a) != len(b) {
 		return false
@@ -375,5 +377,19 @@ outer:
 		}
 		return false
 	}
+	fa, fb := firstIssuedTokenPolicy(a), firstIssuedTokenPolicy(b)
+	if fa != nil && fb != nil && (fa.IssuedTokenType != fb.IssuedTokenType || fa.IssuerEndpointURL != fb.IssuerEndpointURL) {
+		return false
+	}
 	return true
+}
+
+// firstIssuedTokenPolicy returns the first IssuedToken policy in the list, or nil.
+func firstIssuedTokenPolicy(tokens []ua.UserTokenPolicy) *ua.UserTokenPolicy {
+	for i := range tokens {
+		if tokens[i].TokenType == ua.UserTokenTypeIssuedToken {
+			return &tokens[i]
+		}
+	}
+	return nil
 }

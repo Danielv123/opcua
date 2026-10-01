@@ -809,6 +809,40 @@ func TestVerifyServerEndpoints(t *testing.T) {
 	}
 }
 
+// TestVerifyServerEndpointsIssuedTokenOrder verifies that the issued token type selected by the client, which is
+// the type of the first IssuedToken policy, cannot be changed by reordering the discovered token policies.
+func TestVerifyServerEndpointsIssuedTokenOrder(t *testing.T) {
+	cert := newTestRSACertificate(t)
+	jwt128 := ua.UserTokenPolicy{PolicyID: "jwt_0", TokenType: ua.UserTokenTypeIssuedToken, IssuedTokenType: "urn:jwt", SecurityPolicyURI: ua.SecurityPolicyURIBasic128Rsa15}
+	jwt256 := ua.UserTokenPolicy{PolicyID: "jwt_1", TokenType: ua.UserTokenTypeIssuedToken, IssuedTokenType: "urn:jwt", SecurityPolicyURI: ua.SecurityPolicyURIAes256Sha256RsaPss}
+	saml128 := ua.UserTokenPolicy{PolicyID: "saml_0", TokenType: ua.UserTokenTypeIssuedToken, IssuedTokenType: "urn:saml", SecurityPolicyURI: ua.SecurityPolicyURIBasic128Rsa15}
+	anon := anonymousToken("anon_0")
+	endpoint := func(tokens ...ua.UserTokenPolicy) []ua.EndpointDescription {
+		return []ua.EndpointDescription{testEndpoint(ua.SecurityPolicyURIBasic256Sha256, ua.MessageSecurityModeSignAndEncrypt, 1, cert, tokens...)}
+	}
+	session := endpoint(anon, jwt256, saml128, jwt128)
+	tests := []struct {
+		name      string
+		discovery []ua.EndpointDescription
+		wantErr   bool
+	}{
+		{name: "same order", discovery: endpoint(anon, jwt256, saml128, jwt128)},
+		{name: "reordered within the first issued token type", discovery: endpoint(jwt128, anon, saml128, jwt256)},
+		{name: "other issued token type moved first", discovery: endpoint(saml128, anon, jwt256, jwt128), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyServerEndpoints(tt.discovery, session)
+			if tt.wantErr && err != ua.BadSecurityChecksFailed {
+				t.Errorf("verifyServerEndpoints() error = %v, want %v", err, ua.BadSecurityChecksFailed)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("verifyServerEndpoints() error = %v, want nil", err)
+			}
+		})
+	}
+}
+
 // TestOpenRejectsSecuredChannelWithoutServerCertificate verifies that a Sign or SignAndEncrypt channel
 // without a server certificate fails before connecting, rather than skipping certificate validation.
 func TestOpenRejectsSecuredChannelWithoutServerCertificate(t *testing.T) {

@@ -282,7 +282,12 @@ func (s *fakeServer) handle(conn net.Conn) {
 			}
 			writeChunk(conn, ua.MessageTypeFinal, out.Bytes())
 
-		default: // CloseSecureChannel or unexpected message
+		case ua.MessageTypeCloseFinal:
+			// wait for the client to close the connection. Closing it first races with the client's
+			// handling of its own CloseSecureChannel request, which can make the client report an error.
+			continue
+
+		default: // unexpected message
 			return
 		}
 	}
