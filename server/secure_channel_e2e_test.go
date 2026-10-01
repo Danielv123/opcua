@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -181,6 +182,143 @@ func openSecureChannelChunk(senderCert []byte) securechanneltest.AsymmetricChunk
 		}),
 		SenderKey:   hardeningClientKey,
 		ReceiverKey: &hardeningServerKey.PublicKey,
+	}
+}
+
+// rawSecureChannel is the client side of a secure channel opened over a raw connection.
+type rawSecureChannel struct {
+	conn           net.Conn
+	mode           ua.MessageSecurityMode
+	channelID      uint32
+	tokenID        uint32
+	keys           securechanneltest.SymmetricKeys
+	sequenceNumber uint32
+}
+
+// openRawSecureChannel opens a secure channel with SecurityPolicy Basic256Sha256 over a raw connection.
+func openRawSecureChannel(t *testing.T, endpointURL string, mode ua.MessageSecurityMode) *rawSecureChannel {
+	t.Helper()
+	policy := new(ua.SecurityPolicyBasic256Sha256)
+	conn := rawConnection(t, endpointURL)
+	clientNonce := make([]byte, 32)
+	rand.Read(clientNonce)
+	opn := openSecureChannelChunk(hardeningClientCert)
+	opn.Body = securechanneltest.EncodeBody(ua.ObjectIDOpenSecureChannelRequestEncodingDefaultBinary, &ua.OpenSecureChannelRequest{
+		RequestHeader:     ua.RequestHeader{RequestHandle: 1, TimeoutHint: 1000},
+		RequestType:       ua.SecurityTokenRequestTypeIssue,
+		SecurityMode:      mode,
+		ClientNonce:       ua.ByteString(clientNonce),
+		RequestedLifetime: 3600000,
+	})
+	chunk, err := opn.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(chunk); err != nil {
+		t.Fatal(err)
+	}
+	if chunk, err = securechanneltest.ReadChunk(conn); err != nil {
+		t.Fatal(err)
+	}
+	if binary.LittleEndian.Uint32(chunk) != ua.MessageTypeOpenFinal {
+		t.Fatalf("got message type %q, want an OpenSecureChannel response", chunk[:4])
+	}
+	_, plainText, err := securechanneltest.DecryptAsymmetric(chunk, policy, hardeningClientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := ua.NewBinaryDecoder(bytes.NewReader(plainText[8:]), ua.NewEncodingContext())
+	var id ua.NodeID
+	res := new(ua.OpenSecureChannelResponse)
+	if err := dec.ReadNodeID(&id); err != nil || id != ua.ObjectIDOpenSecureChannelResponseEncodingDefaultBinary {
+		t.Fatalf("unexpected response %v, %v", id, err)
+	}
+	if err := dec.Decode(res); err != nil {
+		t.Fatal(err)
+	}
+	return &rawSecureChannel{
+		conn:           conn,
+		mode:           mode,
+		channelID:      res.SecurityToken.ChannelID,
+		tokenID:        res.SecurityToken.TokenID,
+		keys:           securechanneltest.DeriveKeys(ua.SecurityPolicyURIBasic256Sha256, policy, []byte(res.ServerNonce), clientNonce),
+		sequenceNumber: 2,
+	}
+}
+
+// message returns the next message chunk with a FindServers request.
+func (ch *rawSecureChannel) message(requestID uint32) securechanneltest.SymmetricChunk {
+	c := securechanneltest.SymmetricChunk{
+		MessageType: ua.MessageTypeFinal, ChannelID: ch.channelID, TokenID: ch.tokenID, SequenceNumber: ch.sequenceNumber, RequestID: requestID,
+		Body: securechanneltest.EncodeBody(ua.ObjectIDFindServersRequestEncodingDefaultBinary, &ua.FindServersRequest{
+			RequestHeader: ua.RequestHeader{RequestHandle: requestID, TimeoutHint: 1000},
+		}),
+		Policy: new(ua.SecurityPolicyBasic256Sha256), Mode: ch.mode, Keys: ch.keys,
+	}
+	ch.sequenceNumber++
+	return c
+}
+
+// expectResponse checks that the server answers with a message.
+func expectResponse(t *testing.T, conn net.Conn) {
+	t.Helper()
+	chunk, err := securechanneltest.ReadChunk(conn)
+	if err != nil {
+		t.Fatalf("no response: %v", err)
+	}
+	if binary.LittleEndian.Uint32(chunk) != ua.MessageTypeFinal {
+		t.Fatalf("got message type %q, want a message", chunk[:4])
+	}
+}
+
+// TestSecureChannelRejectsMalformedOpenSecureChannel sends an OpenSecureChannel request with a valid
+// signature and a padding size larger than the chunk, and checks that the server rejects it and
+// remains available (issue #5).
+func TestSecureChannelRejectsMalformedOpenSecureChannel(t *testing.T) {
+	endpointURL := hardeningServerURL(t)
+	conn := rawConnection(t, endpointURL)
+	opn := openSecureChannelChunk(hardeningClientCert)
+	opn.MutateFooter = func(footer []byte) {
+		for i := range footer {
+			footer[i] = 0xFF
+		}
+	}
+	chunk, err := opn.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(chunk); err != nil {
+		t.Fatal(err)
+	}
+	if code := expectRejected(t, conn); code == ua.Good {
+		t.Errorf("got %v, want an error", code)
+	}
+	checkServerAvailable(t, endpointURL)
+}
+
+// TestSecureChannelRejectsMalformedMessageChunk opens a secure channel, then sends chunks that are too
+// short to hold a signature, and checks that the server closes the channel and remains available (issue #5).
+func TestSecureChannelRejectsMalformedMessageChunk(t *testing.T) {
+	endpointURL := hardeningServerURL(t)
+	for _, mode := range []ua.MessageSecurityMode{ua.MessageSecurityModeSign, ua.MessageSecurityModeSignAndEncrypt} {
+		t.Run(mode.String(), func(t *testing.T) {
+			ch := openRawSecureChannel(t, endpointURL, mode)
+			// a valid message is answered.
+			if _, err := ch.conn.Write(ch.message(2).Encode()); err != nil {
+				t.Fatal(err)
+			}
+			expectResponse(t, ch.conn)
+			// the headers of a message, without sequence header, body and signature.
+			chunk := ch.message(3).Encode()[:16]
+			binary.LittleEndian.PutUint32(chunk[4:], 16)
+			if _, err := ch.conn.Write(chunk); err != nil {
+				t.Fatal(err)
+			}
+			if code := expectRejected(t, ch.conn); code == ua.Good {
+				t.Errorf("got %v, want an error", code)
+			}
+			checkServerAvailable(t, endpointURL)
+		})
 	}
 }
 

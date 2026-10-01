@@ -6,12 +6,16 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
+	"hash"
 	"io"
 	"math/big"
 	"net"
@@ -26,6 +30,60 @@ type SymmetricKeys struct {
 	SigningKey           []byte
 	EncryptingKey        []byte
 	InitializationVector []byte
+}
+
+// DeriveKeys derives the symmetric keys from the nonces (OPC UA Part 6, 6.7.5). The keys a sender
+// uses are derived with secret = the receiver's nonce and seed = the sender's nonce.
+func DeriveKeys(policyURI string, policy ua.SecurityPolicy, secret, seed []byte) SymmetricKeys {
+	a, b, c := policy.SymSignatureKeySize(), policy.SymEncryptionKeySize(), policy.SymEncryptionBlockSize()
+	var h func() hash.Hash = sha256.New
+	if policyURI == ua.SecurityPolicyURIBasic128Rsa15 || policyURI == ua.SecurityPolicyURIBasic256 {
+		h = sha1.New
+	}
+	// P_SHA(secret, seed) = HMAC(secret, A(1) + seed) + HMAC(secret, A(2) + seed) + ..., A(i) = HMAC(secret, A(i-1)), A(0) = seed.
+	mac := hmac.New(h, secret)
+	k := []byte{}
+	for ai := seed; len(k) < a+b+c; {
+		mac.Reset()
+		mac.Write(ai)
+		ai = mac.Sum(nil)
+		mac.Reset()
+		mac.Write(ai)
+		mac.Write(seed)
+		k = mac.Sum(k)
+	}
+	return SymmetricKeys{SigningKey: k[:a], EncryptingKey: k[a : a+b], InitializationVector: k[a+b : a+b+c]}
+}
+
+// DecryptAsymmetric decrypts an asymmetric chunk with the receiver's key and returns the size of the
+// plain header and the plain text that follows it (sequence header, body, padding and signature).
+func DecryptAsymmetric(chunk []byte, policy ua.SecurityPolicy, key *rsa.PrivateKey) (int, []byte, error) {
+	r := bytes.NewReader(chunk[12:])
+	dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
+	var policyURI string
+	var cert, thumbprint []byte
+	if err := dec.ReadString(&policyURI); err != nil {
+		return 0, nil, err
+	}
+	if err := dec.ReadByteArray(&cert); err != nil {
+		return 0, nil, err
+	}
+	if err := dec.ReadByteArray(&thumbprint); err != nil {
+		return 0, nil, err
+	}
+	headerSize := len(chunk) - r.Len()
+	plainText := []byte{}
+	for i := headerSize; i < len(chunk); i += key.Size() {
+		if i+key.Size() > len(chunk) {
+			return 0, nil, errors.New("partial cipher text block")
+		}
+		block, err := policy.RSADecrypt(key, chunk[i:i+key.Size()])
+		if err != nil {
+			return 0, nil, err
+		}
+		plainText = append(plainText, block...)
+	}
+	return headerSize, plainText, nil
 }
 
 // SymmetricChunk describes a symmetric (MSG or CLO) message chunk.

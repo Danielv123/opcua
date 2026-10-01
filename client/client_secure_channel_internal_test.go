@@ -184,16 +184,18 @@ func TestClientOpenRejectsInconsistentSecurityMode(t *testing.T) {
 type fakeServer struct {
 	endpointURL string
 	endpoints   func(endpointURL string) []ua.EndpointDescription
+	// openResponse, if not nil, returns the body of the response to an OpenSecureChannel request.
+	openResponse func(requestHandle uint32) []byte
 }
 
-func startFakeServer(t *testing.T, endpoints func(endpointURL string) []ua.EndpointDescription) *fakeServer {
+func startFakeServer(t *testing.T, endpoints func(endpointURL string) []ua.EndpointDescription, openResponse func(requestHandle uint32) []byte) *fakeServer {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close() })
-	s := &fakeServer{endpointURL: "opc.tcp://" + ln.Addr().String(), endpoints: endpoints}
+	s := &fakeServer{endpointURL: "opc.tcp://" + ln.Addr().String(), endpoints: endpoints, openResponse: openResponse}
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -254,6 +256,9 @@ func (s *fakeServer) serve(conn net.Conn) {
 				ResponseHeader: ua.ResponseHeader{Timestamp: time.Now(), RequestHandle: req.RequestHandle},
 				SecurityToken:  ua.ChannelSecurityToken{ChannelID: 1, TokenID: 1, CreatedAt: time.Now(), RevisedLifetime: 3600000},
 			})
+			if s.openResponse != nil {
+				body = s.openResponse(req.RequestHandle)
+			}
 			response, _ = securechanneltest.AsymmetricChunk{ChannelID: 1, PolicyURI: ua.SecurityPolicyURINone,
 				SequenceNumber: sequenceNumber, RequestID: requestID, Body: body}.Encode()
 		case ua.ObjectIDGetEndpointsRequestEncodingDefaultBinary:
@@ -294,7 +299,7 @@ func TestClientDialRejectsUnsupportedServerCertificate(t *testing.T) {
 					TransportProfileURI: ua.TransportProfileURIUaTcpTransport,
 					SecurityLevel:       1,
 				}}
-			})
+			}, nil)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			defer func() {
