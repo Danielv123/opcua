@@ -567,6 +567,50 @@ func TestDialRejectsUnauthenticatedCertificateForUserToken(t *testing.T) {
 	})
 }
 
+// TestDialComparesCreateSessionCertificateByLeaf verifies that the certificate returned by CreateSession must have the
+// same leaf certificate as the certificate of the secure channel, whether or not the issuer chain is included.
+func TestDialComparesCreateSessionCertificateByLeaf(t *testing.T) {
+	leaf, leafPath := newServerCertificate(t)
+	issuer, _ := newServerCertificate(t)
+	other, _ := newServerCertificate(t)
+	e := fakeEndpoint(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone, 0, leaf+issuer,
+		ua.UserTokenPolicy{PolicyID: "username", TokenType: ua.UserTokenTypeUserName, SecurityPolicyURI: ua.SecurityPolicyURIBasic256Sha256})
+	ctx := context.Background()
+	tests := []struct {
+		name              string
+		serverCertificate ua.ByteString
+		wantErr           error
+	}{
+		{name: "same leaf without chain", serverCertificate: leaf},
+		{name: "same leaf with chain", serverCertificate: leaf + issuer},
+		{name: "different leaf", serverCertificate: other, wantErr: ua.BadCertificateInvalid},
+		{name: "missing", serverCertificate: "", wantErr: ua.BadCertificateInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := &fakeServer{discoveryEndpoints: []ua.EndpointDescription{e}, sessionEndpoints: []ua.EndpointDescription{e}, serverCertificate: tt.serverCertificate}
+			srv.start(t)
+			ch, err := client.Dial(ctx, srv.endpointURL,
+				client.WithUserNameIdentity("root", testPassword),
+				client.WithMinSecurityMode(ua.MessageSecurityModeNone),
+				client.WithTrustedCertificatesPaths(leafPath, ""),
+			)
+			if err == nil {
+				ch.Close(ctx)
+			}
+			if err != tt.wantErr {
+				t.Errorf("Dial error = %v, want %v", err, tt.wantErr)
+			}
+			if tt.wantErr != nil && srv.handled("ActivateSession") {
+				t.Error("client activated the session")
+			}
+			if srv.sawPassword() {
+				t.Error("password was sent in plaintext")
+			}
+		})
+	}
+}
+
 // TestDialRejectsSecuredEndpointWithoutCertificate verifies that a secured endpoint, or a user token policy that
 // requires encryption, without a server certificate is rejected rather than skipping certificate validation.
 func TestDialRejectsSecuredEndpointWithoutCertificate(t *testing.T) {

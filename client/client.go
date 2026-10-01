@@ -3,7 +3,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -242,8 +241,9 @@ func (ch *Client) open(ctx context.Context) error {
 	ch.channel.maxRequestMessageSize = createSessionResponse.MaxRequestMessageSize
 
 	// verify the server's certificate is the same as the certificate from the selected endpoint,
-	// which is the certificate used to open the secure channel.
-	if !bytes.Equal(ch.serverCertificate, []byte(createSessionResponse.ServerCertificate)) {
+	// which is the certificate used to open the secure channel. The certificate may be sent with
+	// or without its chain of issuer certificates, so the leaf certificates are compared.
+	if !sameLeafCertificate(ua.ByteString(ch.serverCertificate), createSessionResponse.ServerCertificate) {
 		return ua.BadCertificateInvalid
 	}
 
