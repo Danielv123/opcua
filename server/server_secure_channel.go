@@ -188,12 +188,12 @@ func (ch *serverSecureChannel) Open() error {
 	buf := *(ch.bytesPool.Get().(*[]byte))
 	defer ch.bytesPool.Put(&buf)
 	ch.conn.SetDeadline(ch.tokenExpiration)
-	_, err := ch.read(buf)
+	n, err := ch.read(buf)
 	if err != nil {
 		return ua.BadDecodingError
 	}
 
-	var reader = bytes.NewReader(buf)
+	var reader = bytes.NewReader(buf[:n])
 	var ec = ua.NewEncodingContext()
 	var dec = ua.NewBinaryDecoder(reader, ec)
 
@@ -229,6 +229,11 @@ func (ch *serverSecureChannel) Open() error {
 		}
 		if err := dec.ReadString(&ch.endpointURL); err != nil {
 			return ua.BadDecodingError
+		}
+		// OPC UA Part 6 limits the EndpointUrl of a Hello message to 4096 bytes.
+		const maxEndpointURLLength = 4096
+		if len(ch.endpointURL) > maxEndpointURLLength {
+			return ua.BadTCPEndpointURLInvalid
 		}
 		// log.Printf("-> Hello { ver: %d, rec: %d, snd: %d, msg: %d, chk: %d, ep: %s }\n", remoteProtocolVersion, remoteReceiveBufferSize, remoteSendBufferSize, remoteMaxMessageSize, remoteMaxChunkCount, ch.endpointURL)
 

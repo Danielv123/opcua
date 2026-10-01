@@ -19,16 +19,270 @@ var (
 	typeToDecoderMap sync.Map
 )
 
+const (
+	// maxNestingDepth limits how deeply Variants, DataValues, ExtensionObjects and
+	// DiagnosticInfos may be nested within one another, so that a crafted message
+	// cannot exhaust the stack. Each of these values counts as one level. Other
+	// OPC UA stacks use similar limits, e.g. open62541 allows 100 levels.
+	maxNestingDepth = 100
+
+	// maxPreallocBytes limits the memory allocated for a String, ByteString or array
+	// before its contents have been read, when its length cannot be checked against
+	// the remaining input, or when its decoded elements are larger than their encoding.
+	// Beyond this, memory is allocated as the contents are decoded, so that the memory
+	// used stays proportional to the size of the input.
+	maxPreallocBytes = 64 * 1024
+
+	// maxEmptyArraySlices limits the number of slices allocated for a
+	// multi-dimensional array with no elements, e.g. one of ArrayDimensions [n, 0].
+	maxEmptyArraySlices = 64 * 1024
+
+	// resampleInterval is the number of bytes that must be read before the decoder
+	// samples the length of an input that reports it with a Len() int64 method again.
+	resampleInterval = 64 * 1024
+)
+
+// intLener is implemented by inputs that report the number of unread bytes, such as
+// *bytes.Reader and *bytes.Buffer.
+type intLener interface {
+	Len() int
+}
+
+// int64Lener is implemented by inputs that report the number of unread bytes, such as
+// the buffers of github.com/djherbis/buffer.
+type int64Lener interface {
+	Len() int64
+}
+
 // BinaryDecoder decodes the UA binary protocol.
 type BinaryDecoder struct {
 	r  io.Reader
 	ec EncodingContext
 	bs [8]byte
+
+	// lenr reports the number of unread bytes of r, if r has a Len() int method.
+	lenr intLener
+	// len64r reports the number of unread bytes of r, if r has a Len() int64 method.
+	// As this may be costly, its result is sampled, and the bytes read since are
+	// subtracted from the sample.
+	len64r int64Lener
+	// read is the number of bytes read from r.
+	read int64
+	// sampledLen is the result of the last call of len64r.Len().
+	sampledLen int64
+	// sampledAt is the value of read when sampledLen was sampled, or -1.
+	sampledAt int64
+
+	// depth is the current nesting depth of Variants, DataValues, ExtensionObjects
+	// and DiagnosticInfos.
+	depth int
+	// nestingLimitExceeded reports whether the nesting depth limit was exceeded
+	// while decoding the current outermost value.
+	nestingLimitExceeded bool
 }
 
 // NewBinaryDecoder returns a new decoder that reads from an io.Reader.
+//
+// If r reports the number of unread bytes with a Len method, as *bytes.Reader,
+// *bytes.Buffer and the buffers of github.com/djherbis/buffer do, then Strings,
+// ByteStrings and arrays whose encoded length exceeds the unread bytes are rejected
+// before memory is allocated for them. Otherwise, memory for long Strings,
+// ByteStrings and arrays is allocated as their contents are read.
 func NewBinaryDecoder(r io.Reader, ec EncodingContext) *BinaryDecoder {
-	return &BinaryDecoder{r, ec, [8]byte{}}
+	dec := &BinaryDecoder{r: r, ec: ec, sampledAt: -1}
+	switch l := r.(type) {
+	case intLener:
+		dec.lenr = l
+	case int64Lener:
+		dec.len64r = l
+	}
+	return dec
+}
+
+// readFull reads exactly len(p) bytes.
+func (dec *BinaryDecoder) readFull(p []byte) error {
+	n, err := io.ReadFull(dec.r, p)
+	dec.read += int64(n)
+	if err != nil {
+		return BadDecodingError
+	}
+	return nil
+}
+
+// remaining returns the number of unread bytes of the input, or -1 if unknown.
+func (dec *BinaryDecoder) remaining() int64 {
+	if dec.lenr != nil {
+		return int64(dec.lenr.Len())
+	}
+	if dec.len64r != nil {
+		if dec.sampledAt < 0 {
+			dec.sampleLen()
+		}
+		if n := dec.sampledLen - (dec.read - dec.sampledAt); n > 0 {
+			return n
+		}
+		return 0
+	}
+	return -1
+}
+
+// sampleLen samples the number of unread bytes of an input with a Len() int64 method.
+func (dec *BinaryDecoder) sampleLen() {
+	dec.sampledLen = dec.len64r.Len()
+	dec.sampledAt = dec.read
+}
+
+// checkAvailable returns BadDecodingError if fewer than n bytes of the input remain
+// unread. It reports whether the number of unread bytes is known.
+func (dec *BinaryDecoder) checkAvailable(n int64) (bool, error) {
+	rem := dec.remaining()
+	if rem < 0 {
+		return false, nil
+	}
+	if n <= rem {
+		return true, nil
+	}
+	// the input may have grown since its length was sampled, so sample it again,
+	// but not too often, since this may be costly.
+	if dec.len64r != nil && dec.read-dec.sampledAt >= resampleInterval {
+		dec.sampleLen()
+		if n <= dec.sampledLen {
+			return true, nil
+		}
+	}
+	return true, BadDecodingError
+}
+
+// readLength reads the Int32 length of a String, ByteString or array. It returns -1
+// if the value is null, and BadDecodingError if the length is otherwise negative.
+func (dec *BinaryDecoder) readLength() (int, error) {
+	var n int32
+	if err := dec.ReadInt32(&n); err != nil {
+		return 0, BadDecodingError
+	}
+	if n < -1 {
+		return 0, BadDecodingError
+	}
+	return int(n), nil
+}
+
+// readBytes reads n bytes, where n is a length read from the input.
+func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
+	known, err := dec.checkAvailable(int64(n))
+	if err != nil {
+		return nil, err
+	}
+	if known || n <= maxPreallocBytes {
+		bs := make([]byte, n)
+		if err := dec.readFull(bs); err != nil {
+			return nil, err
+		}
+		return bs, nil
+	}
+	// the number of unread bytes is unknown, so grow the slice as the bytes arrive.
+	bs := make([]byte, 0, maxPreallocBytes)
+	for len(bs) < n {
+		if len(bs) == cap(bs) {
+			bs = append(bs, 0)[:len(bs)]
+		}
+		m := min(cap(bs), n)
+		if err := dec.readFull(bs[len(bs):m]); err != nil {
+			return nil, err
+		}
+		bs = bs[:m]
+	}
+	return bs, nil
+}
+
+// preallocLen returns the capacity to allocate for an array of n elements of
+// elemSize bytes, each encoded in at least minSize bytes, where known reports whether
+// the encoded size of the array has been checked against the remaining input.
+func preallocLen(n int, known bool, elemSize uintptr, minSize int64) int {
+	if elemSize == 0 || (known && int64(elemSize) <= minSize) {
+		// the array is no larger than its encoding.
+		return n
+	}
+	return min(n, max(1, maxPreallocBytes/int(elemSize)))
+}
+
+// readArray reads an array of elements that are each encoded in at least minSize bytes.
+func readArray[T any](dec *BinaryDecoder, minSize int64, read func(*BinaryDecoder, *T) error) ([]T, error) {
+	n, err := dec.readLength()
+	if err != nil {
+		return nil, err
+	}
+	if n < 0 {
+		return nil, nil
+	}
+	known, err := dec.checkAvailable(int64(n) * minSize)
+	if err != nil {
+		return nil, err
+	}
+	var zero T
+	values := make([]T, 0, preallocLen(n, known, unsafe.Sizeof(zero), minSize))
+	for i := 0; i < n; i++ {
+		values = append(values, zero)
+		if err := read(dec, &values[i]); err != nil {
+			return nil, err
+		}
+	}
+	return values, nil
+}
+
+// enter increments the nesting depth before decoding a value that may contain other
+// values. It returns BadEncodingLimitsExceeded if the depth would exceed the limit.
+func (dec *BinaryDecoder) enter() error {
+	if dec.depth >= maxNestingDepth {
+		dec.nestingLimitExceeded = true
+		return BadEncodingLimitsExceeded
+	}
+	dec.depth++
+	return nil
+}
+
+// leave decrements the nesting depth after decoding a value that may contain other values.
+func (dec *BinaryDecoder) leave() {
+	dec.depth--
+	if dec.depth == 0 {
+		dec.nestingLimitExceeded = false
+	}
+}
+
+// minEncodedSize returns the minimum number of bytes in the encoding of a value of the type.
+func minEncodedSize(typ reflect.Type) int64 {
+	switch typ {
+	case typeDateTime:
+		return 8
+	case typeGUID:
+		return 16
+	case typeNodeID, typeExpandedNodeID:
+		return 2
+	case typeQualifiedName:
+		return 6
+	case typeLocalizedText, typeDataValue, typeDiagnosticInfo, typeVariant:
+		return 1
+	case typeExtensionObject:
+		return 3
+	}
+	switch typ.Kind() {
+	case reflect.Bool, reflect.Int8, reflect.Uint8:
+		return 1
+	case reflect.Int16, reflect.Uint16:
+		return 2
+	case reflect.Int32, reflect.Uint32, reflect.Float32, reflect.String, reflect.Slice:
+		return 4
+	case reflect.Int64, reflect.Uint64, reflect.Float64:
+		return 8
+	case reflect.Ptr:
+		return minEncodedSize(typ.Elem())
+	case reflect.Struct:
+		var n int64
+		for i := 0; i < typ.NumField(); i++ {
+			n += minEncodedSize(typ.Field(i).Type)
+		}
+		return n
+	}
+	return 0
 }
 
 type decoderFunc func(*BinaryDecoder, unsafe.Pointer) error
@@ -191,34 +445,37 @@ func getSliceDecoder(typ reflect.Type) (decoderFunc, error) {
 	if err != nil {
 		return nil, err
 	}
+	// count elements as at least one byte, so that an array of empty structures
+	// cannot make the decoder spin.
+	minSize := max(1, minEncodedSize(elem))
 	return func(buf *BinaryDecoder, p unsafe.Pointer) error {
-		hdr := (*sliceHeader)(p)
-		var l int32
-		if err := buf.ReadInt32(&l); err != nil {
+		n, err := buf.readLength()
+		if err != nil {
 			return err
 		}
-		len := int(l)
-		if len <= 0 {
-			hdr.data = unsafe.Pointer(reflect.MakeSlice(typ, 0, 0).Pointer())
-			hdr.len = 0
-			hdr.cap = 0
+		if n <= 0 {
+			reflect.NewAt(typ, p).Elem().Set(reflect.MakeSlice(typ, 0, 0))
 			return nil
 		}
-		hdr.data = unsafe.Pointer(reflect.MakeSlice(typ, len, len).Pointer())
-		hdr.len = len
-		hdr.cap = len
-		//decode first element
-		p2 := hdr.data
-		if err := elemDecoder(buf, p2); err != nil {
+		known, err := buf.checkAvailable(int64(n) * minSize)
+		if err != nil {
 			return err
 		}
-		//decode remaining elements
-		for i := 1; i < len; i++ {
-			p2 = unsafe.Pointer(uintptr(p2) + elemSize)
-			if err := elemDecoder(buf, p2); err != nil {
+		c := preallocLen(n, known, elemSize, minSize)
+		s := reflect.MakeSlice(typ, c, c)
+		for i := 0; i < n; i++ {
+			if i == c {
+				// grow the slice as elements are decoded.
+				c = min(2*c, n)
+				s2 := reflect.MakeSlice(typ, c, c)
+				reflect.Copy(s2, s)
+				s = s2
+			}
+			if err := elemDecoder(buf, unsafe.Add(s.UnsafePointer(), uintptr(i)*elemSize)); err != nil {
 				return err
 			}
 		}
+		reflect.NewAt(typ, p).Elem().Set(s)
 		return nil
 	}, nil
 }
@@ -340,7 +597,7 @@ func getByteArrayDecoder() (decoderFunc, error) {
 
 // ReadBoolean reads a bool.
 func (dec *BinaryDecoder) ReadBoolean(value *bool) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:1]); err != nil {
+	if err := dec.readFull(dec.bs[:1]); err != nil {
 		return BadDecodingError
 	}
 	*value = dec.bs[0] != 0
@@ -349,7 +606,7 @@ func (dec *BinaryDecoder) ReadBoolean(value *bool) error {
 
 // ReadSByte reads a int8.
 func (dec *BinaryDecoder) ReadSByte(value *int8) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:1]); err != nil {
+	if err := dec.readFull(dec.bs[:1]); err != nil {
 		return BadDecodingError
 	}
 	*value = int8(dec.bs[0])
@@ -358,7 +615,7 @@ func (dec *BinaryDecoder) ReadSByte(value *int8) error {
 
 // ReadByte reads a byte.
 func (dec *BinaryDecoder) ReadByte(value *byte) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:1]); err != nil {
+	if err := dec.readFull(dec.bs[:1]); err != nil {
 		return BadDecodingError
 	}
 	*value = dec.bs[0]
@@ -367,7 +624,7 @@ func (dec *BinaryDecoder) ReadByte(value *byte) error {
 
 // ReadInt16 reads a int16.
 func (dec *BinaryDecoder) ReadInt16(value *int16) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:2]); err != nil {
+	if err := dec.readFull(dec.bs[:2]); err != nil {
 		return BadDecodingError
 	}
 	*value = int16(binary.LittleEndian.Uint16(dec.bs[:2]))
@@ -376,7 +633,7 @@ func (dec *BinaryDecoder) ReadInt16(value *int16) error {
 
 // ReadUInt16 reads a uint16.
 func (dec *BinaryDecoder) ReadUInt16(value *uint16) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:2]); err != nil {
+	if err := dec.readFull(dec.bs[:2]); err != nil {
 		return BadDecodingError
 	}
 	*value = binary.LittleEndian.Uint16(dec.bs[:2])
@@ -385,7 +642,7 @@ func (dec *BinaryDecoder) ReadUInt16(value *uint16) error {
 
 // ReadInt32 reads a int32.
 func (dec *BinaryDecoder) ReadInt32(value *int32) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:4]); err != nil {
+	if err := dec.readFull(dec.bs[:4]); err != nil {
 		return BadDecodingError
 	}
 	*value = int32(binary.LittleEndian.Uint32(dec.bs[:4]))
@@ -394,7 +651,7 @@ func (dec *BinaryDecoder) ReadInt32(value *int32) error {
 
 // ReadUInt32 reads a uint32.
 func (dec *BinaryDecoder) ReadUInt32(value *uint32) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:4]); err != nil {
+	if err := dec.readFull(dec.bs[:4]); err != nil {
 		return BadDecodingError
 	}
 	*value = binary.LittleEndian.Uint32(dec.bs[:4])
@@ -403,7 +660,7 @@ func (dec *BinaryDecoder) ReadUInt32(value *uint32) error {
 
 // ReadInt64 reads a int64.
 func (dec *BinaryDecoder) ReadInt64(value *int64) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:8]); err != nil {
+	if err := dec.readFull(dec.bs[:8]); err != nil {
 		return BadDecodingError
 	}
 	*value = int64(binary.LittleEndian.Uint64(dec.bs[:8]))
@@ -412,7 +669,7 @@ func (dec *BinaryDecoder) ReadInt64(value *int64) error {
 
 // ReadUInt64 reads a int64.
 func (dec *BinaryDecoder) ReadUInt64(value *uint64) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:8]); err != nil {
+	if err := dec.readFull(dec.bs[:8]); err != nil {
 		return BadDecodingError
 	}
 	*value = binary.LittleEndian.Uint64(dec.bs[:8])
@@ -421,7 +678,7 @@ func (dec *BinaryDecoder) ReadUInt64(value *uint64) error {
 
 // ReadFloat reads a float32.
 func (dec *BinaryDecoder) ReadFloat(value *float32) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:4]); err != nil {
+	if err := dec.readFull(dec.bs[:4]); err != nil {
 		return BadDecodingError
 	}
 	*value = math.Float32frombits(binary.LittleEndian.Uint32(dec.bs[:4]))
@@ -430,7 +687,7 @@ func (dec *BinaryDecoder) ReadFloat(value *float32) error {
 
 // ReadDouble reads a float64.
 func (dec *BinaryDecoder) ReadDouble(value *float64) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:8]); err != nil {
+	if err := dec.readFull(dec.bs[:8]); err != nil {
 		return BadDecodingError
 	}
 	*value = math.Float64frombits(binary.LittleEndian.Uint64(dec.bs[:8]))
@@ -439,16 +696,16 @@ func (dec *BinaryDecoder) ReadDouble(value *float64) error {
 
 // ReadString reads a string.
 func (dec *BinaryDecoder) ReadString(value *string) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	n, err := dec.readLength()
+	if err != nil {
 		return BadDecodingError
 	}
 	if n < 0 {
 		*value = ""
 		return nil
 	}
-	bs := make([]byte, n)
-	if _, err := io.ReadFull(dec.r, bs); err != nil {
+	bs, err := dec.readBytes(n)
+	if err != nil {
 		return BadDecodingError
 	}
 	// eliminate alloc of a second byte array and copying from one byte array to another.
@@ -475,7 +732,7 @@ func (dec *BinaryDecoder) ReadDateTime(value *time.Time) error {
 
 // ReadGUID reads a uuid.UUID.
 func (dec *BinaryDecoder) ReadGUID(value *uuid.UUID) error {
-	if _, err := io.ReadFull(dec.r, dec.bs[:8]); err != nil {
+	if err := dec.readFull(dec.bs[:8]); err != nil {
 		return BadDecodingError
 	}
 	v := uuid.UUID{}
@@ -487,7 +744,7 @@ func (dec *BinaryDecoder) ReadGUID(value *uuid.UUID) error {
 	v[5] = dec.bs[4]
 	v[6] = dec.bs[7]
 	v[7] = dec.bs[6]
-	if _, err := io.ReadFull(dec.r, v[8:]); err != nil {
+	if err := dec.readFull(v[8:]); err != nil {
 		return BadDecodingError
 	}
 	*value = v
@@ -496,16 +753,16 @@ func (dec *BinaryDecoder) ReadGUID(value *uuid.UUID) error {
 
 // ReadByteString reads a ByteString.
 func (dec *BinaryDecoder) ReadByteString(value *ByteString) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	n, err := dec.readLength()
+	if err != nil {
 		return BadDecodingError
 	}
 	if n <= 0 {
 		*value = ""
 		return nil
 	}
-	bs := make([]byte, n)
-	if _, err := io.ReadFull(dec.r, bs); err != nil {
+	bs, err := dec.readBytes(n)
+	if err != nil {
 		return BadDecodingError
 	}
 	*value = *(*ByteString)(unsafe.Pointer(&bs))
@@ -767,6 +1024,10 @@ func (dec *BinaryDecoder) ReadLocalizedText(value *LocalizedText) error {
 
 // ReadExtensionObject reads an Extensionobject.
 func (dec *BinaryDecoder) ReadExtensionObject(value *ExtensionObject) error {
+	if err := dec.enter(); err != nil {
+		return err
+	}
+	defer dec.leave()
 	var nodeID NodeID
 	if err := dec.ReadNodeID(&nodeID); err != nil {
 		return BadDecodingError
@@ -783,8 +1044,11 @@ func (dec *BinaryDecoder) ReadExtensionObject(value *ExtensionObject) error {
 		// lookup type
 		typ, ok := FindTypeForBinaryEncodingID(id)
 		if ok {
-			var unused int32
-			if err := dec.ReadInt32(&unused); err != nil {
+			length, err := dec.readLength()
+			if err != nil {
+				return BadDecodingError
+			}
+			if _, err := dec.checkAvailable(int64(length)); err != nil {
 				return BadDecodingError
 			}
 			obj := reflect.New(typ).Elem().Interface() // TODO: decide if ptr or struct
@@ -823,12 +1087,19 @@ func (dec *BinaryDecoder) ReadDataValue(value *DataValue) error {
 		serverPicoseconds uint16
 		err               error
 	)
+	if err := dec.enter(); err != nil {
+		return err
+	}
+	defer dec.leave()
 	var b byte
 	if err := dec.ReadByte(&b); err != nil {
 		return BadDecodingError
 	}
 	if (b & 1) != 0 {
 		if err := dec.ReadVariant(&v); err != nil {
+			if dec.nestingLimitExceeded {
+				return BadEncodingLimitsExceeded
+			}
 			// return BadDecodingError
 			statusCode = BadDataTypeIDUnknown
 		}
@@ -864,6 +1135,10 @@ func (dec *BinaryDecoder) ReadDataValue(value *DataValue) error {
 
 // ReadVariant reads a Variant.
 func (dec *BinaryDecoder) ReadVariant(value *Variant) error {
+	if err := dec.enter(); err != nil {
+		return err
+	}
+	defer dec.leave()
 	var b byte
 	if err := dec.ReadByte(&b); err != nil {
 		return BadDecodingError
@@ -1299,758 +1574,120 @@ func (dec *BinaryDecoder) ReadVariant(value *Variant) error {
 		*value = nil
 		return nil
 	case VariantTypeBoolean:
-		var vals []bool
-		if err := dec.ReadBooleanArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]bool, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]bool, dims[0])
-			for i := range res {
-				res[i] = make([][]bool, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadBooleanArray)
 	case VariantTypeSByte:
-		var vals []int8
-		if err := dec.ReadSByteArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]int8, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]int8, dims[0])
-			for i := range res {
-				res[i] = make([][]int8, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadSByteArray)
 	case VariantTypeByte:
-		var vals []byte
-		if err := dec.ReadByteArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]byte, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]byte, dims[0])
-			for i := range res {
-				res[i] = make([][]byte, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadByteArray)
 	case VariantTypeInt16:
-		var vals []int16
-		if err := dec.ReadInt16Array(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]int16, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]int16, dims[0])
-			for i := range res {
-				res[i] = make([][]int16, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadInt16Array)
 	case VariantTypeUInt16:
-		var vals []uint16
-		if err := dec.ReadUInt16Array(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]uint16, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]uint16, dims[0])
-			for i := range res {
-				res[i] = make([][]uint16, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadUInt16Array)
 	case VariantTypeInt32:
-		var vals []int32
-		if err := dec.ReadInt32Array(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]int32, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]int32, dims[0])
-			for i := range res {
-				res[i] = make([][]int32, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadInt32Array)
 	case VariantTypeUInt32:
-		var vals []uint32
-		if err := dec.ReadUInt32Array(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]uint32, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]uint32, dims[0])
-			for i := range res {
-				res[i] = make([][]uint32, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadUInt32Array)
 	case VariantTypeInt64:
-		var vals []int64
-		if err := dec.ReadInt64Array(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]int64, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]int64, dims[0])
-			for i := range res {
-				res[i] = make([][]int64, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadInt64Array)
 	case VariantTypeUInt64:
-		var vals []uint64
-		if err := dec.ReadUInt64Array(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]uint64, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]uint64, dims[0])
-			for i := range res {
-				res[i] = make([][]uint64, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadUInt64Array)
 	case VariantTypeFloat:
-		var vals []float32
-		if err := dec.ReadFloatArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]float32, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]float32, dims[0])
-			for i := range res {
-				res[i] = make([][]float32, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadFloatArray)
 	case VariantTypeDouble:
-		var vals []float64
-		if err := dec.ReadDoubleArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]float64, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]float64, dims[0])
-			for i := range res {
-				res[i] = make([][]float64, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadDoubleArray)
 	case VariantTypeString:
-		var vals []string
-		if err := dec.ReadStringArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]string, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]string, dims[0])
-			for i := range res {
-				res[i] = make([][]string, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadStringArray)
 	case VariantTypeDateTime:
-		var vals []time.Time
-		if err := dec.ReadDateTimeArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]time.Time, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]time.Time, dims[0])
-			for i := range res {
-				res[i] = make([][]time.Time, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadDateTimeArray)
 	case VariantTypeGUID:
-		var vals []uuid.UUID
-		if err := dec.ReadGUIDArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]uuid.UUID, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]uuid.UUID, dims[0])
-			for i := range res {
-				res[i] = make([][]uuid.UUID, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadGUIDArray)
 	case VariantTypeByteString:
-		var vals []ByteString
-		if err := dec.ReadByteStringArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]ByteString, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]ByteString, dims[0])
-			for i := range res {
-				res[i] = make([][]ByteString, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadByteStringArray)
 	case VariantTypeXMLElement:
-		var vals []XMLElement
-		if err := dec.ReadXMLElementArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]XMLElement, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]XMLElement, dims[0])
-			for i := range res {
-				res[i] = make([][]XMLElement, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadXMLElementArray)
 	case VariantTypeNodeID:
-		var vals []NodeID
-		if err := dec.ReadNodeIDArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]NodeID, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]NodeID, dims[0])
-			for i := range res {
-				res[i] = make([][]NodeID, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadNodeIDArray)
 	case VariantTypeExpandedNodeID:
-		var vals []ExpandedNodeID
-		if err := dec.ReadExpandedNodeIDArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]ExpandedNodeID, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]ExpandedNodeID, dims[0])
-			for i := range res {
-				res[i] = make([][]ExpandedNodeID, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadExpandedNodeIDArray)
 	case VariantTypeStatusCode:
-		var vals []StatusCode
-		if err := dec.ReadStatusCodeArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]StatusCode, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]StatusCode, dims[0])
-			for i := range res {
-				res[i] = make([][]StatusCode, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadStatusCodeArray)
 	case VariantTypeQualifiedName:
-		var vals []QualifiedName
-		if err := dec.ReadQualifiedNameArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]QualifiedName, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]QualifiedName, dims[0])
-			for i := range res {
-				res[i] = make([][]QualifiedName, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadQualifiedNameArray)
 	case VariantTypeLocalizedText:
-		var vals []LocalizedText
-		if err := dec.ReadLocalizedTextArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]LocalizedText, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]LocalizedText, dims[0])
-			for i := range res {
-				res[i] = make([][]LocalizedText, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadLocalizedTextArray)
 	case VariantTypeExtensionObject:
-		var vals []ExtensionObject
-		if err := dec.ReadExtensionObjectArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]ExtensionObject, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]ExtensionObject, dims[0])
-			for i := range res {
-				res[i] = make([][]ExtensionObject, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadExtensionObjectArray)
 	case VariantTypeDataValue:
-		var vals []DataValue
-		if err := dec.ReadDataValueArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]DataValue, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]DataValue, dims[0])
-			for i := range res {
-				res[i] = make([][]DataValue, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadDataValueArray)
 	case VariantTypeVariant:
-		var vals []Variant
-		if err := dec.ReadVariantArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]Variant, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]Variant, dims[0])
-			for i := range res {
-				res[i] = make([][]Variant, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadVariantArray)
 	case VariantTypeDiagnosticInfo:
-		var vals []DiagnosticInfo
-		if err := dec.ReadDiagnosticInfoArray(&vals); err != nil {
-			return BadDecodingError
-		}
-		var dims []int32
-		if err := dec.ReadInt32Array(&dims); err != nil {
-			return BadDecodingError
-		}
-		if len(dims) == 2 {
-			res := make([][]DiagnosticInfo, dims[0])
-			for i := range res {
-				res[i], vals = vals[:dims[1]], vals[dims[1]:]
-			}
-			*value = res
-			return nil
-		}
-		if len(dims) == 3 {
-			res := make([][][]DiagnosticInfo, dims[0])
-			for i := range res {
-				res[i] = make([][]DiagnosticInfo, dims[1])
-				for j := range res[i] {
-					res[i][j], vals = vals[:dims[2]], vals[dims[2]:]
-				}
-			}
-			*value = res
-			return nil
-		}
-		return BadDecodingError
-
+		return readMatrix(dec, value, (*BinaryDecoder).ReadDiagnosticInfoArray)
 	default:
 		return BadDecodingError
 	}
+}
+
+// readMatrix reads the values and ArrayDimensions of a multi-dimensional array of
+// two or three dimensions, and stores the array in value as nested slices.
+func readMatrix[T any](dec *BinaryDecoder, value *Variant, readValues func(*BinaryDecoder, *[]T) error) error {
+	var vals []T
+	if err := readValues(dec, &vals); err != nil {
+		return BadDecodingError
+	}
+	var dims []int32
+	if err := dec.ReadInt32Array(&dims); err != nil {
+		return BadDecodingError
+	}
+	if err := checkArrayDimensions(dims, len(vals)); err != nil {
+		return err
+	}
+	if len(dims) == 2 {
+		d1 := int(dims[1])
+		res := make([][]T, dims[0])
+		for i := range res {
+			res[i], vals = vals[:d1:d1], vals[d1:]
+		}
+		*value = res
+		return nil
+	}
+	d1, d2 := int(dims[1]), int(dims[2])
+	res := make([][][]T, dims[0])
+	for i := range res {
+		res[i] = make([][]T, d1)
+		for j := range res[i] {
+			res[i][j], vals = vals[:d2:d2], vals[d2:]
+		}
+	}
+	*value = res
+	return nil
+}
+
+// checkArrayDimensions returns BadDecodingError unless dims are the ArrayDimensions
+// of a multi-dimensional array of two or three dimensions with n elements.
+func checkArrayDimensions(dims []int32, n int) error {
+	if len(dims) != 2 && len(dims) != 3 {
+		return BadDecodingError
+	}
+	// limit the number of slices that hold the elements. If the array has elements,
+	// there are no more slices at any level than elements. If it has none, as when a
+	// dimension is zero, limit them to a fixed number.
+	limit := max(int64(n), maxEmptyArraySlices)
+	count := int64(1)
+	for _, d := range dims {
+		if d < 0 {
+			return BadDecodingError
+		}
+		// count <= limit <= math.MaxInt32, so this cannot overflow.
+		count *= int64(d)
+		if count > limit {
+			return BadDecodingError
+		}
+	}
+	if count != int64(n) {
+		return BadDecodingError
+	}
+	return nil
 }
 
 // split recursively creates a multi-dimensional array from a set of values
@@ -2131,19 +1768,9 @@ func (dec *BinaryDecoder) ReadDiagnosticInfo(value *DiagnosticInfo) error {
 
 // ReadBooleanArray reads a bool array.
 func (dec *BinaryDecoder) ReadBooleanArray(value *[]bool) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]bool, n)
-	for i := range temp {
-		if err := dec.ReadBoolean(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadBoolean)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2151,19 +1778,9 @@ func (dec *BinaryDecoder) ReadBooleanArray(value *[]bool) error {
 
 // ReadSByteArray reads a int8 array.
 func (dec *BinaryDecoder) ReadSByteArray(value *[]int8) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]int8, n)
-	for i := range temp {
-		if err := dec.ReadSByte(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadSByte)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2171,16 +1788,16 @@ func (dec *BinaryDecoder) ReadSByteArray(value *[]int8) error {
 
 // ReadByteArray reads a byte array.
 func (dec *BinaryDecoder) ReadByteArray(value *[]byte) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
+	n, err := dec.readLength()
+	if err != nil {
+		return err
 	}
 	if n < 0 {
 		*value = nil
 		return nil
 	}
-	temp := make([]byte, n)
-	if _, err := io.ReadFull(dec.r, temp); err != nil {
+	temp, err := dec.readBytes(n)
+	if err != nil {
 		return err
 	}
 	*value = temp
@@ -2189,19 +1806,9 @@ func (dec *BinaryDecoder) ReadByteArray(value *[]byte) error {
 
 // ReadInt16Array reads a int16 array.
 func (dec *BinaryDecoder) ReadInt16Array(value *[]int16) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]int16, n)
-	for i := range temp {
-		if err := dec.ReadInt16(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 2, (*BinaryDecoder).ReadInt16)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2209,19 +1816,9 @@ func (dec *BinaryDecoder) ReadInt16Array(value *[]int16) error {
 
 // ReadUInt16Array reads a uint16 array.
 func (dec *BinaryDecoder) ReadUInt16Array(value *[]uint16) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]uint16, n)
-	for i := range temp {
-		if err := dec.ReadUInt16(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 2, (*BinaryDecoder).ReadUInt16)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2229,19 +1826,9 @@ func (dec *BinaryDecoder) ReadUInt16Array(value *[]uint16) error {
 
 // ReadInt32Array reads a int32 array.
 func (dec *BinaryDecoder) ReadInt32Array(value *[]int32) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]int32, n)
-	for i := range temp {
-		if err := dec.ReadInt32(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadInt32)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2249,19 +1836,9 @@ func (dec *BinaryDecoder) ReadInt32Array(value *[]int32) error {
 
 // ReadUInt32Array reads a uint32 array.
 func (dec *BinaryDecoder) ReadUInt32Array(value *[]uint32) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]uint32, n)
-	for i := range temp {
-		if err := dec.ReadUInt32(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadUInt32)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2269,19 +1846,9 @@ func (dec *BinaryDecoder) ReadUInt32Array(value *[]uint32) error {
 
 // ReadInt64Array reads a int64 array.
 func (dec *BinaryDecoder) ReadInt64Array(value *[]int64) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]int64, n)
-	for i := range temp {
-		if err := dec.ReadInt64(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 8, (*BinaryDecoder).ReadInt64)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2289,19 +1856,9 @@ func (dec *BinaryDecoder) ReadInt64Array(value *[]int64) error {
 
 // ReadUInt64Array reads a uint64 array.
 func (dec *BinaryDecoder) ReadUInt64Array(value *[]uint64) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]uint64, n)
-	for i := range temp {
-		if err := dec.ReadUInt64(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 8, (*BinaryDecoder).ReadUInt64)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2309,19 +1866,9 @@ func (dec *BinaryDecoder) ReadUInt64Array(value *[]uint64) error {
 
 // ReadFloatArray reads a float32 array.
 func (dec *BinaryDecoder) ReadFloatArray(value *[]float32) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]float32, n)
-	for i := range temp {
-		if err := dec.ReadFloat(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadFloat)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2329,19 +1876,9 @@ func (dec *BinaryDecoder) ReadFloatArray(value *[]float32) error {
 
 // ReadDoubleArray reads a float64 array.
 func (dec *BinaryDecoder) ReadDoubleArray(value *[]float64) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
-		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]float64, n)
-	for i := range temp {
-		if err := dec.ReadDouble(&temp[i]); err != nil {
-			return err
-		}
+	temp, err := readArray(dec, 8, (*BinaryDecoder).ReadDouble)
+	if err != nil {
+		return err
 	}
 	*value = temp
 	return nil
@@ -2349,19 +1886,9 @@ func (dec *BinaryDecoder) ReadDoubleArray(value *[]float64) error {
 
 // ReadStringArray reads a string array.
 func (dec *BinaryDecoder) ReadStringArray(value *[]string) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadString)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]string, n)
-	for i := range temp {
-		if err := dec.ReadString(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2369,19 +1896,9 @@ func (dec *BinaryDecoder) ReadStringArray(value *[]string) error {
 
 // ReadDateTimeArray reads a Time array.
 func (dec *BinaryDecoder) ReadDateTimeArray(value *[]time.Time) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 8, (*BinaryDecoder).ReadDateTime)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]time.Time, n)
-	for i := range temp {
-		if err := dec.ReadDateTime(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2389,19 +1906,9 @@ func (dec *BinaryDecoder) ReadDateTimeArray(value *[]time.Time) error {
 
 // ReadGUIDArray reads a UUID array.
 func (dec *BinaryDecoder) ReadGUIDArray(value *[]uuid.UUID) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 16, (*BinaryDecoder).ReadGUID)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]uuid.UUID, n)
-	for i := range temp {
-		if err := dec.ReadGUID(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2409,19 +1916,9 @@ func (dec *BinaryDecoder) ReadGUIDArray(value *[]uuid.UUID) error {
 
 // ReadByteStringArray reads a ByteString array.
 func (dec *BinaryDecoder) ReadByteStringArray(value *[]ByteString) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadByteString)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]ByteString, n)
-	for i := 0; i < len(temp); i++ {
-		if err := dec.ReadByteString(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2429,19 +1926,9 @@ func (dec *BinaryDecoder) ReadByteStringArray(value *[]ByteString) error {
 
 // ReadXMLElementArray reads a XMLElement array.
 func (dec *BinaryDecoder) ReadXMLElementArray(value *[]XMLElement) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadXMLElement)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]XMLElement, n)
-	for i := 0; i < len(temp); i++ {
-		if err := dec.ReadXMLElement(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2449,19 +1936,9 @@ func (dec *BinaryDecoder) ReadXMLElementArray(value *[]XMLElement) error {
 
 // ReadNodeIDArray reads a NodeID array.
 func (dec *BinaryDecoder) ReadNodeIDArray(value *[]NodeID) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 2, (*BinaryDecoder).ReadNodeID)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]NodeID, n)
-	for i := range temp {
-		if err := dec.ReadNodeID(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2469,19 +1946,9 @@ func (dec *BinaryDecoder) ReadNodeIDArray(value *[]NodeID) error {
 
 // ReadExpandedNodeIDArray reads a ExpandedNodeID array.
 func (dec *BinaryDecoder) ReadExpandedNodeIDArray(value *[]ExpandedNodeID) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 2, (*BinaryDecoder).ReadExpandedNodeID)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]ExpandedNodeID, n)
-	for i := range temp {
-		if err := dec.ReadExpandedNodeID(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2489,19 +1956,9 @@ func (dec *BinaryDecoder) ReadExpandedNodeIDArray(value *[]ExpandedNodeID) error
 
 // ReadStatusCodeArray reads a StatusCode array.
 func (dec *BinaryDecoder) ReadStatusCodeArray(value *[]StatusCode) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadStatusCode)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]StatusCode, n)
-	for i := range temp {
-		if err := dec.ReadStatusCode(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2509,19 +1966,9 @@ func (dec *BinaryDecoder) ReadStatusCodeArray(value *[]StatusCode) error {
 
 // ReadQualifiedNameArray reads a QualifiedName array.
 func (dec *BinaryDecoder) ReadQualifiedNameArray(value *[]QualifiedName) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 6, (*BinaryDecoder).ReadQualifiedName)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]QualifiedName, n)
-	for i := range temp {
-		if err := dec.ReadQualifiedName(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2529,19 +1976,9 @@ func (dec *BinaryDecoder) ReadQualifiedNameArray(value *[]QualifiedName) error {
 
 // ReadLocalizedTextArray reads a LocalizedText array.
 func (dec *BinaryDecoder) ReadLocalizedTextArray(value *[]LocalizedText) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadLocalizedText)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]LocalizedText, n)
-	for i := range temp {
-		if err := dec.ReadLocalizedText(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2549,19 +1986,9 @@ func (dec *BinaryDecoder) ReadLocalizedTextArray(value *[]LocalizedText) error {
 
 // ReadExtensionObjectArray reads a ExtensionObject array.
 func (dec *BinaryDecoder) ReadExtensionObjectArray(value *[]ExtensionObject) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 3, (*BinaryDecoder).ReadExtensionObject)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]ExtensionObject, n)
-	for i := range temp {
-		if err := dec.ReadExtensionObject(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2569,19 +1996,9 @@ func (dec *BinaryDecoder) ReadExtensionObjectArray(value *[]ExtensionObject) err
 
 // ReadDataValueArray reads a DataValue array.
 func (dec *BinaryDecoder) ReadDataValueArray(value *[]DataValue) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadDataValue)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]DataValue, n)
-	for i := 0; i < len(temp); i++ {
-		if err := dec.ReadDataValue(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2589,19 +2006,9 @@ func (dec *BinaryDecoder) ReadDataValueArray(value *[]DataValue) error {
 
 // ReadVariantArray reads a Variant array.
 func (dec *BinaryDecoder) ReadVariantArray(value *[]Variant) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadVariant)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]Variant, n)
-	for i := 0; i < len(temp); i++ {
-		if err := dec.ReadVariant(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
@@ -2609,19 +2016,9 @@ func (dec *BinaryDecoder) ReadVariantArray(value *[]Variant) error {
 
 // ReadDiagnosticInfoArray reads a DiagnosticInfo array.
 func (dec *BinaryDecoder) ReadDiagnosticInfoArray(value *[]DiagnosticInfo) error {
-	var n int32
-	if err := dec.ReadInt32(&n); err != nil {
+	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadDiagnosticInfo)
+	if err != nil {
 		return BadDecodingError
-	}
-	if n < 0 {
-		*value = nil
-		return nil
-	}
-	temp := make([]DiagnosticInfo, n)
-	for i := 0; i < len(temp); i++ {
-		if err := dec.ReadDiagnosticInfo(&temp[i]); err != nil {
-			return BadDecodingError
-		}
 	}
 	*value = temp
 	return nil
