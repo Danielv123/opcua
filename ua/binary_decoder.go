@@ -33,12 +33,13 @@ const (
 	// so that the memory used stays proportional to the size of the input.
 	maxPreallocBytes = 64 * 1024
 
-	// maxPreallocRatio limits the memory allocated for an array before its elements
+	// maxPreallocRatio limits the memory allocated for arrays before their elements
 	// have been decoded to this many bytes per unread byte of the input, if that is
-	// more than maxPreallocBytes. Decoded elements may be much larger than their
-	// encoding (a DataValue may be encoded in one byte), so this bounds the memory
-	// allocated for an array that then fails to decode. Beyond this, memory is
-	// allocated as elements are decoded.
+	// more than maxPreallocBytes. This limit applies to all the arrays being decoded,
+	// which may be nested. Decoded elements may be much larger than their encoding
+	// (a DataValue may be encoded in one byte), so this bounds the memory allocated
+	// for arrays that then fail to decode. Beyond this, memory is allocated as
+	// elements are decoded.
 	maxPreallocRatio = 4
 
 	// maxEmptyArraySlices limits the number of slices at each level of a
@@ -80,6 +81,9 @@ type BinaryDecoder struct {
 	// limit is the value of read at the end of the ExtensionObject body being
 	// decoded, or math.MaxInt64.
 	limit int64
+	// reserved is the memory allocated for the arrays being decoded before their
+	// elements were decoded.
+	reserved int64
 
 	// depth is the current nesting depth of Variants, DataValues, ExtensionObjects
 	// and DiagnosticInfos.
@@ -222,18 +226,23 @@ func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
 	return bs, nil
 }
 
-// preallocLen returns the capacity to allocate for an array of n elements of
-// elemSize bytes before they are decoded, where rem is the number of unread bytes
-// of the input, or -1 if unknown.
-func preallocLen(n int, elemSize uintptr, rem int64) int {
+// reserve returns the capacity to allocate for an array of n elements of elemSize
+// bytes before they are decoded, where rem is the number of unread bytes of the
+// input, or -1 if unknown. It also returns the memory reserved for the array, which
+// the caller must release once the array has been decoded, or has failed to decode.
+func (dec *BinaryDecoder) reserve(n int, elemSize uintptr, rem int64) (int, int64) {
 	if elemSize == 0 {
-		return n
+		return n, 0
 	}
 	limit := int64(maxPreallocBytes)
 	if rem >= 0 {
 		limit = max(limit, min(rem, math.MaxInt64/maxPreallocRatio)*maxPreallocRatio)
 	}
-	return int(min(int64(n), max(1, limit/int64(elemSize))))
+	// arrays that contain this one have already reserved memory.
+	c := min(int64(n), max(1, (limit-dec.reserved)/int64(elemSize)))
+	r := c * int64(elemSize)
+	dec.reserved += r
+	return int(c), r
 }
 
 // readArray reads an array of elements that are each encoded in at least minSize bytes.
@@ -250,13 +259,16 @@ func readArray[T any](dec *BinaryDecoder, minSize int64, read func(*BinaryDecode
 		return nil, err
 	}
 	var zero T
-	values := make([]T, 0, preallocLen(n, unsafe.Sizeof(zero), rem))
+	c, reserved := dec.reserve(n, unsafe.Sizeof(zero), rem)
+	values := make([]T, 0, c)
 	for i := 0; i < n; i++ {
 		values = append(values, zero)
 		if err := read(dec, &values[i]); err != nil {
+			dec.reserved -= reserved
 			return nil, err
 		}
 	}
+	dec.reserved -= reserved
 	return values, nil
 }
 
@@ -495,7 +507,7 @@ func getSliceDecoder(typ reflect.Type) (decoderFunc, error) {
 		if err != nil {
 			return err
 		}
-		c := preallocLen(n, elemSize, rem)
+		c, reserved := buf.reserve(n, elemSize, rem)
 		s := reflect.MakeSlice(typ, c, c)
 		for i := 0; i < n; i++ {
 			if i == c {
@@ -506,9 +518,11 @@ func getSliceDecoder(typ reflect.Type) (decoderFunc, error) {
 				s = s2
 			}
 			if err := elemDecoder(buf, unsafe.Add(s.UnsafePointer(), uintptr(i)*elemSize)); err != nil {
+				buf.reserved -= reserved
 				return err
 			}
 		}
+		buf.reserved -= reserved
 		reflect.NewAt(typ, p).Elem().Set(s)
 		return nil
 	}, nil
@@ -1161,9 +1175,13 @@ func (dec *BinaryDecoder) readDataValue(value *DataValue) error {
 			statusCode = BadDataTypeIDUnknown
 		}
 	}
-	if (b&2) != 0 && statusCode == 0 {
-		if err := dec.ReadStatusCode(&statusCode); err != nil {
+	if (b & 2) != 0 {
+		var sc StatusCode
+		if err := dec.ReadStatusCode(&sc); err != nil {
 			return BadDecodingError
+		}
+		if statusCode == 0 {
+			statusCode = sc
 		}
 	}
 	if (b & 4) != 0 {

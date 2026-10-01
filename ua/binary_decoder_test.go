@@ -329,6 +329,28 @@ func TestDecodeArrayPreallocationIsProportional(t *testing.T) {
 	}
 }
 
+func TestDecodeNestedArrayPreallocationIsProportional(t *testing.T) {
+	// Variant arrays nested beyond the nesting limit, each of which declares as many
+	// elements as there are bytes of input.
+	const n = 200_000
+	input := bytes.Repeat(cat([]byte{0x98}, le32(n)), 120)
+	input = cat(input, make([]byte, n+1000-len(input)))
+	for kind, r := range readerKinds(input) {
+		dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		var v ua.Variant
+		if err := dec.ReadVariant(&v); err == nil {
+			t.Fatalf("%s: expected an error", kind)
+		}
+		runtime.ReadMemStats(&after)
+		if a := after.TotalAlloc - before.TotalAlloc; a > 4*uint64(len(input))+128*1024 {
+			t.Fatalf("%s: decoder allocated %d bytes for a %d byte input", kind, a, len(input))
+		}
+	}
+}
+
 func TestDecodeNullAndEmptyArrays(t *testing.T) {
 	for kind, r := range readerKinds(cat(le32(-1), le32(0))) {
 		dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
@@ -562,7 +584,8 @@ func TestDecodeDataValueWithUnsupportedVariant(t *testing.T) {
 	// a DataValue reports a Variant that it read, but cannot represent, as BadDataTypeIDUnknown.
 	rank4 := cat([]byte{0xC6}, le32(1), le32(7), le32(4), le32(1), le32(1), le32(1), le32(1))
 	timestamp := make([]byte, 8)
-	input := cat([]byte{0x05}, rank4, timestamp, []byte{0x01, 0x06}, le32(8))
+	// the DataValue has a value, a status code and a source timestamp.
+	input := cat([]byte{0x07}, rank4, le32(int32(ua.GoodClamped)), timestamp, []byte{0x01, 0x06}, le32(8))
 	for kind, r := range readerKinds(input) {
 		dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
 		var dv ua.DataValue
