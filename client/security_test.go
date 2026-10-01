@@ -400,6 +400,31 @@ func TestDialRejectsEndpointBelowMinSecurityMode(t *testing.T) {
 	}
 }
 
+// TestDialRejectsCredentialsWithoutClientCertificateByDefault verifies that, without a client certificate,
+// Dial does not send credentials over an unsecured channel unless the caller accepts it explicitly, since an
+// on-path attacker can relay the encrypted user token to the server to take over the session.
+func TestDialRejectsCredentialsWithoutClientCertificateByDefault(t *testing.T) {
+	cert, certPath := newServerCertificate(t)
+	e := fakeEndpoint(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone, 0, cert,
+		ua.UserTokenPolicy{PolicyID: "username", TokenType: ua.UserTokenTypeUserName, SecurityPolicyURI: ua.SecurityPolicyURIBasic256Sha256})
+	srv := &fakeServer{discoveryEndpoints: []ua.EndpointDescription{e}, sessionEndpoints: []ua.EndpointDescription{e}, serverCertificate: cert}
+	srv.start(t)
+	ch, err := client.Dial(context.Background(), srv.endpointURL,
+		client.WithUserNameIdentity("root", testPassword),
+		client.WithTrustedCertificatesPaths(certPath, ""),
+	)
+	if err == nil {
+		ch.Abort(context.Background())
+		t.Fatal("Dial succeeded, want error")
+	}
+	if err != ua.BadSecurityModeRejected {
+		t.Errorf("Dial error = %v, want %v", err, ua.BadSecurityModeRejected)
+	}
+	if n := srv.connections(); n != 1 {
+		t.Errorf("client made %d connections, want only the discovery connection", n)
+	}
+}
+
 // TestDialRejectsPlaintextPassword verifies that Dial never sends a password in plaintext when discovery
 // advertises only a None endpoint with a None UserName token policy.
 func TestDialRejectsPlaintextPassword(t *testing.T) {
@@ -410,6 +435,7 @@ func TestDialRejectsPlaintextPassword(t *testing.T) {
 	srv.start(t)
 	ch, err := client.Dial(context.Background(), srv.endpointURL,
 		client.WithUserNameIdentity("root", testPassword),
+		client.WithMinSecurityMode(ua.MessageSecurityModeNone),
 		client.WithInsecureSkipVerify(),
 	)
 	if err == nil {
@@ -435,6 +461,7 @@ func TestDialRejectsPlaintextIssuedToken(t *testing.T) {
 	srv.start(t)
 	ch, err := client.Dial(context.Background(), srv.endpointURL,
 		client.WithIssuedIdentity([]byte(testPassword)),
+		client.WithMinSecurityMode(ua.MessageSecurityModeNone),
 		client.WithInsecureSkipVerify(),
 	)
 	if err == nil {
@@ -460,6 +487,7 @@ func TestDialAllowsPlaintextPasswordWithOptIn(t *testing.T) {
 	ctx := context.Background()
 	ch, err := client.Dial(ctx, srv.endpointURL,
 		client.WithUserNameIdentity("root", testPassword),
+		client.WithMinSecurityMode(ua.MessageSecurityModeNone),
 		client.WithInsecurePlaintextCredentials(),
 	)
 	if err != nil {
@@ -498,6 +526,7 @@ func TestDialRejectsUnauthenticatedCertificateForUserToken(t *testing.T) {
 		srv.start(t)
 		ch, err := client.Dial(ctx, srv.endpointURL,
 			client.WithUserNameIdentity("root", testPassword),
+			client.WithMinSecurityMode(ua.MessageSecurityModeNone),
 			client.WithTrustedCertificatesPaths(otherCertPath, ""),
 		)
 		if err == nil {
@@ -517,6 +546,7 @@ func TestDialRejectsUnauthenticatedCertificateForUserToken(t *testing.T) {
 		srv.start(t)
 		ch, err := client.Dial(ctx, srv.endpointURL,
 			client.WithUserNameIdentity("root", testPassword),
+			client.WithMinSecurityMode(ua.MessageSecurityModeNone),
 			client.WithTrustedCertificatesPaths(attackerCertPath, ""),
 		)
 		if err != nil {
@@ -555,7 +585,7 @@ func TestDialRejectsSecuredEndpointWithoutCertificate(t *testing.T) {
 			name: "encrypted UserName token on None endpoint",
 			endpoint: fakeEndpoint(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone, 255, "",
 				ua.UserTokenPolicy{PolicyID: "username", TokenType: ua.UserTokenTypeUserName, SecurityPolicyURI: ua.SecurityPolicyURIBasic256Sha256}),
-			opts: []client.Option{client.WithUserNameIdentity("root", testPassword)},
+			opts: []client.Option{client.WithUserNameIdentity("root", testPassword), client.WithMinSecurityMode(ua.MessageSecurityModeNone)},
 		},
 	}
 	for _, tt := range tests {
@@ -591,6 +621,7 @@ func TestDialRejectsCreateSessionEndpointMismatch(t *testing.T) {
 	srv.start(t)
 	ch, err := client.Dial(context.Background(), srv.endpointURL,
 		client.WithUserNameIdentity("root", testPassword),
+		client.WithMinSecurityMode(ua.MessageSecurityModeNone),
 		client.WithInsecurePlaintextCredentials(),
 	)
 	if err == nil {

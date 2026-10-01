@@ -31,8 +31,13 @@ func WithSecurityPolicyURI(uri string, securityMode ua.MessageSecurityMode) Opti
 // remove the secured endpoints from the list. Endpoints weaker than the minimum are never selected,
 // and Dial fails with BadSecurityModeRejected if no endpoint satisfies the minimum.
 // The minimum also applies to an endpoint requested with WithSecurityPolicyURI.
-// (default: MessageSecurityModeSign if a client certificate is set, the user identity is a UserName,
-// Issued or X509 identity, and the endpoint is selected automatically; otherwise MessageSecurityModeNone)
+// (default: MessageSecurityModeSign if the user identity is a UserName, Issued or X509 identity and the
+// endpoint is selected automatically; otherwise MessageSecurityModeNone)
+// A secured channel requires a client certificate. Without one, a client with credentials must accept
+// an unsecured channel explicitly with WithMinSecurityMode(ua.MessageSecurityModeNone), or by requesting
+// the endpoint with WithSecurityPolicyURI(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone). On an
+// unsecured channel an on-path attacker cannot read an encrypted password, but can relay the user token
+// to the server to take over the session.
 func WithMinSecurityMode(securityMode ua.MessageSecurityMode) Option {
 	return func(c *Client) error {
 		switch securityMode {

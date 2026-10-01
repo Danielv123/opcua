@@ -116,13 +116,14 @@ func compareEndpointRank(a, b *ua.EndpointDescription) int {
 
 // effectiveMinSecurityMode returns the minimum message security mode that endpoint selection accepts.
 // Unless set with WithMinSecurityMode, this is MessageSecurityModeSign when the endpoint is selected
-// automatically, the client has a certificate (so it can open a secure channel), and the user identity
-// carries credentials. Otherwise it is MessageSecurityModeNone.
+// automatically and the user identity carries credentials, since on a channel without security an on-path
+// attacker can relay the (encrypted or signed) user token to the server to take over the session.
+// Opening a secured channel requires a client certificate. Otherwise it is MessageSecurityModeNone.
 func (ch *Client) effectiveMinSecurityMode() ua.MessageSecurityMode {
 	if ch.minSecurityMode != ua.MessageSecurityModeInvalid {
 		return ch.minSecurityMode
 	}
-	if ch.securityPolicyURI == ua.SecurityPolicyURIBestAvailable && ch.securityMode == ua.MessageSecurityModeInvalid && len(ch.localCertificate) > 0 {
+	if ch.securityPolicyURI == ua.SecurityPolicyURIBestAvailable && ch.securityMode == ua.MessageSecurityModeInvalid {
 		switch ch.userIdentity.(type) {
 		case ua.UserNameIdentity, ua.IssuedIdentity, ua.X509Identity:
 			return ua.MessageSecurityModeSign
@@ -137,8 +138,9 @@ func (ch *Client) effectiveMinSecurityMode() ua.MessageSecurityMode {
 // unless sending it in plaintext was allowed with WithInsecurePlaintextCredentials.
 // The token policy with the strongest security policy is selected, so a token policy that encrypts the
 // token is preferred over one that does not. A token policy with an unsupported security policy uri is never used.
-// If the server certificate is missing or unusable for a token policy stronger than the selected one, selection
-// fails with BadCertificateInvalid, rather than falling back to a weaker token policy.
+// If the server certificate needed to encrypt the secret is missing or unusable for a token policy stronger than
+// the selected one, selection fails with BadCertificateInvalid, rather than falling back to a weaker token policy.
+// An X509 identity's token is signed with the identity's key, which must be large enough for the token policy.
 // For an IssuedIdentity, only token policies with the same IssuedTokenType and IssuerEndpointURL as the first
 // IssuedToken policy are considered, since the token data is only valid for one token type.
 func (ch *Client) selectUserTokenPolicy(e *ua.EndpointDescription) (*ua.UserTokenPolicy, error) {
@@ -184,8 +186,8 @@ func (ch *Client) selectUserTokenPolicy(e *ua.EndpointDescription) (*ua.UserToke
 				continue
 			}
 		default:
-			// token is encrypted (or signed) with the server certificate.
-			if !isUsableCertificate(e.ServerCertificate, policyURI) {
+			// a secret is encrypted with the server certificate.
+			if secret && !isUsableCertificate(e.ServerCertificate, policyURI) {
 				if strength > certificateRejected {
 					certificateRejected = strength
 				}
@@ -331,13 +333,30 @@ func endpointsMatch(d, s *ua.EndpointDescription) bool {
 	}
 	// servers may omit the certificates from the endpoints returned in the CreateSessionResponse.
 	// A certificate missing from discovery does not match, as an attacker may have removed it.
-	if len(s.ServerCertificate) > 0 && d.ServerCertificate != s.ServerCertificate {
+	if len(s.ServerCertificate) > 0 && !sameLeafCertificate(d.ServerCertificate, s.ServerCertificate) {
 		return false
 	}
 	if s.Server.ApplicationURI != "" && d.Server.ApplicationURI != s.Server.ApplicationURI {
 		return false
 	}
 	return true
+}
+
+// sameLeafCertificate returns true if the certificates have the same leaf certificate.
+// A certificate may be sent with or without its chain of issuer certificates.
+func sameLeafCertificate(a, b ua.ByteString) bool {
+	if a == b {
+		return true
+	}
+	ca, err := x509.ParseCertificates([]byte(a))
+	if err != nil || len(ca) == 0 {
+		return false
+	}
+	cb, err := x509.ParseCertificates([]byte(b))
+	if err != nil || len(cb) == 0 {
+		return false
+	}
+	return ca[0].Equal(cb[0])
 }
 
 // sameUserTokenPolicies returns true if the lists contain the same user token policies, in any order.

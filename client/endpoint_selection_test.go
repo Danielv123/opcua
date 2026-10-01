@@ -113,9 +113,14 @@ func TestSelectEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	strongKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
 	clientCert := []byte(newTestRSACertificate(t))
 	withClientCert := WithClientCertificate(clientCert, nil)
 	withUserName := WithUserNameIdentity("user", "password")
+	minNone := WithMinSecurityMode(ua.MessageSecurityModeNone)
 
 	const (
 		none   = ua.SecurityPolicyURINone
@@ -257,8 +262,49 @@ func TestSelectEndpoint(t *testing.T) {
 			wantPolicy: b256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "anon_1",
 		},
 		{
-			name: "plaintext password over None is rejected",
+			name: "credentials without client certificate are rejected by default",
 			opts: []Option{withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", b256)),
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 5, serverCert, userNameToken("user_1", b256)),
+			},
+			wantErr: ua.BadSecurityModeRejected,
+		},
+		{
+			name: "issued identity without client certificate is rejected by default",
+			opts: []Option{WithIssuedIdentity([]byte("token"))},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, issuedToken("issued_0", b256)),
+			},
+			wantErr: ua.BadSecurityModeRejected,
+		},
+		{
+			name: "explicit None endpoint allows credentials without client certificate",
+			opts: []Option{withUserName, WithSecurityPolicyURI(none, ua.MessageSecurityModeNone)},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", b256)),
+			},
+			wantPolicy: none, wantMode: ua.MessageSecurityModeNone, wantToken: "user_0",
+		},
+		{
+			name: "x509 token policy does not apply its key size to the server certificate",
+			opts: []Option{withClientCert, WithX509Identity(clientCert, strongKey)},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b128, ua.MessageSecurityModeSignAndEncrypt, 5, weakCert, x509Token("x509_0", b256)),
+			},
+			wantPolicy: b128, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "x509_0",
+		},
+		{
+			name: "x509 token on None endpoint does not need a server certificate",
+			opts: []Option{minNone, WithX509Identity(clientCert, strongKey)},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", x509Token("x509_0", b256)),
+			},
+			wantPolicy: none, wantMode: ua.MessageSecurityModeNone, wantToken: "x509_0",
+		},
+		{
+			name: "plaintext password over None is rejected",
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", userNameToken("user_0", none)),
 			},
@@ -266,7 +312,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "plaintext password over None is rejected when token policy is empty",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", "")),
 			},
@@ -290,7 +336,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "plaintext password over None is allowed with opt-in",
-			opts: []Option{withUserName, WithInsecurePlaintextCredentials()},
+			opts: []Option{minNone, withUserName, WithInsecurePlaintextCredentials()},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", userNameToken("user_0", none)),
 			},
@@ -298,7 +344,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "plaintext issued token over None is rejected",
-			opts: []Option{WithIssuedIdentity([]byte("token"))},
+			opts: []Option{minNone, WithIssuedIdentity([]byte("token"))},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", issuedToken("issued_0", none)),
 			},
@@ -306,7 +352,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "encrypted password requires server certificate",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", userNameToken("user_0", b256)),
 			},
@@ -314,7 +360,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "encrypted password requires RSA server certificate",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, ecdsaCert, userNameToken("user_0", b256)),
 			},
@@ -322,7 +368,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "encrypted password over None with server certificate",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", b256)),
 			},
@@ -330,7 +376,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "prefers encrypted token policy over plaintext",
-			opts: []Option{withUserName, WithInsecurePlaintextCredentials()},
+			opts: []Option{minNone, withUserName, WithInsecurePlaintextCredentials()},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", none), userNameToken("user_1", b256)),
 			},
@@ -346,7 +392,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "skips plaintext token policy for encrypted one",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", none), userNameToken("user_1", b256)),
 			},
@@ -354,7 +400,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "unsupported token policy is never used",
-			opts: []Option{withUserName, WithInsecurePlaintextCredentials()},
+			opts: []Option{minNone, withUserName, WithInsecurePlaintextCredentials()},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", "http://example.com/UA/SecurityPolicy#Unknown")),
 			},
@@ -362,7 +408,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "missing token type is rejected",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, anonymousToken("anon_0")),
 			},
@@ -442,7 +488,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "equal-ranked endpoint without certificate for token encryption fails (weak first)",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", b128)),
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", userNameToken("user_1", aes256)),
@@ -467,7 +513,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "token encryption requires the key size of the token policy",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, weakCert, userNameToken("user_0", aes256)),
 			},
@@ -485,7 +531,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "plaintext token is not used when certificate for encrypted token is missing",
-			opts: []Option{withUserName, WithInsecurePlaintextCredentials()},
+			opts: []Option{minNone, withUserName, WithInsecurePlaintextCredentials()},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", userNameToken("user_0", b256), userNameToken("user_1", none)),
 			},
@@ -493,7 +539,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "weaker token policy is not used when certificate is too small for stronger token policy",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, weakCert, userNameToken("user_0", aes256), userNameToken("user_1", b128)),
 			},
@@ -521,7 +567,7 @@ func TestSelectEndpoint(t *testing.T) {
 		},
 		{
 			name: "selects strongest token policy",
-			opts: []Option{withUserName},
+			opts: []Option{minNone, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", b128), userNameToken("user_1", aes256), userNameToken("user_2", b256)),
 			},
@@ -669,6 +715,18 @@ func TestVerifyServerEndpoints(t *testing.T) {
 		}},
 		{name: "application uri changed", wantErr: true, modify: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
 			eps[1].Server.ApplicationURI = "urn:other"
+			return eps
+		}},
+		{name: "certificate chain in discovery, leaf only from server", modifyDiscovery: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
+			for i := range eps {
+				eps[i].ServerCertificate = cert + otherCert
+			}
+			return eps
+		}},
+		{name: "leaf only in discovery, certificate chain from server", modify: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
+			for i := range eps {
+				eps[i].ServerCertificate = cert + otherCert
+			}
 			return eps
 		}},
 		{name: "certificate stripped from discovery", wantErr: true, modifyDiscovery: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
