@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/awcullen/opcua/internal/securechannel"
 	"github.com/awcullen/opcua/ua"
 	"github.com/djherbis/buffer"
 )
@@ -187,7 +188,8 @@ func newClientSecureChannel(
 		trace:                                trace,
 	}
 	if certs, err := x509.ParseCertificates(ch.remoteCertificate); err == nil && len(certs) > 0 {
-		ch.remotePublicKey = certs[0].PublicKey.(*rsa.PublicKey)
+		// the key remains nil if the certificate does not hold a supported RSA key.
+		ch.remotePublicKey, _ = securechannel.RSAPublicKey(certs[0])
 		ch.remoteThumbprint = sha1.Sum(certs[0].Raw)
 	}
 	return ch
@@ -431,6 +433,11 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 			return ua.BadSecurityChecksFailed
 		}
 		ch.remotePublicKeySize = ch.remotePublicKey.Size()
+	default:
+		// the session would need the server's RSA key for any security policy but None.
+		if ch.securityPolicyURI != ua.SecurityPolicyURINone {
+			return ua.BadSecurityModeRejected
+		}
 	}
 
 	ch.pendingResponseCh = make(chan *ua.ServiceOperation, 32)

@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/awcullen/opcua/internal/securechannel"
 	"github.com/awcullen/opcua/ua"
 	"github.com/djherbis/buffer"
 )
@@ -279,6 +280,12 @@ func (ch *serverSecureChannel) Open() error {
 	}
 
 	ch.securityMode = oscr.SecurityMode
+	// the security mode must be consistent with the security policy, since the remote
+	// certificate is only validated for the secured modes.
+	secured := ch.securityMode == ua.MessageSecurityModeSignAndEncrypt || ch.securityMode == ua.MessageSecurityModeSign
+	if secured != (ch.securityPolicyURI != ua.SecurityPolicyURINone) {
+		return ua.BadSecurityModeRejected
+	}
 	if ch.securityMode == ua.MessageSecurityModeSignAndEncrypt || ch.securityMode == ua.MessageSecurityModeSign {
 		ch.localNonce = getNextNonce(ch.securityPolicy.NonceSize())
 	} else {
@@ -338,7 +345,11 @@ func (ch *serverSecureChannel) Open() error {
 			return err
 		}
 		cert := certs[0]
-		ch.remotePublicKey = cert.PublicKey.(*rsa.PublicKey)
+		remotePublicKey, err := securechannel.RSAPublicKey(cert)
+		if err != nil {
+			return err
+		}
+		ch.remotePublicKey = remotePublicKey
 		if len(cert.URIs) > 0 {
 			ch.remoteApplicationURI = cert.URIs[0].String()
 		}
@@ -1215,16 +1226,35 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 				return nil, 0, ua.BadDecodingError
 			}
 			// asymmetric header
-			if err := decoder.ReadString(&ch.securityPolicyURI); err != nil {
+			var securityPolicyURI string
+			var remoteCertificate, remoteCertificateThumbprint []byte
+			if err := decoder.ReadString(&securityPolicyURI); err != nil {
 				return nil, 0, ua.BadDecodingError
 			}
-			if err := decoder.ReadByteArray(&ch.remoteCertificate); err != nil {
+			if err := decoder.ReadByteArray(&remoteCertificate); err != nil {
 				return nil, 0, ua.BadDecodingError
 			}
-			if err := decoder.ReadByteArray(&ch.remoteCertificateThumbprint); err != nil {
+			if err := decoder.ReadByteArray(&remoteCertificateThumbprint); err != nil {
 				return nil, 0, ua.BadDecodingError
 			}
 			plainHeaderSize = count - stream.Len()
+
+			// once the channel is open, a renewal must not change the channel, the security policy or
+			// the remote certificate, which is only validated when the channel is opened.
+			if ch.pendingTokenID != 0 {
+				if channelID != ch.channelID {
+					return nil, 0, ua.BadTCPSecureChannelUnknown
+				}
+				if securityPolicyURI != ch.securityPolicyURI {
+					return nil, 0, ua.BadSecurityPolicyRejected
+				}
+				if !bytes.Equal(remoteCertificate, ch.remoteCertificate) {
+					return nil, 0, ua.BadSecurityChecksFailed
+				}
+			}
+			ch.securityPolicyURI = securityPolicyURI
+			ch.remoteCertificate = remoteCertificate
+			ch.remoteCertificateThumbprint = remoteCertificateThumbprint
 
 			// setSecurityPolicy
 			switch ch.securityPolicyURI {
@@ -1265,13 +1295,13 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 					return nil, 0, ua.BadSecurityChecksFailed
 				}
 
-				if crts, err := x509.ParseCertificates(ch.remoteCertificate); err == nil && len(crts) > 0 {
-					ch.remotePublicKey = crts[0].PublicKey.(*rsa.PublicKey)
+				// the certificate is validated against the trust list only later (in Open), so check
+				// that it holds a supported RSA key before any RSA operation.
+				remotePublicKey, err := securechannel.ParseRSAPublicKey(ch.remoteCertificate)
+				if err != nil {
+					return nil, 0, err
 				}
-
-				if ch.remotePublicKey == nil {
-					return nil, 0, ua.BadSecurityChecksFailed
-				}
+				ch.remotePublicKey = remotePublicKey
 
 				cipherTextBlockSize := ch.localPrivateKey.Size()
 				cipherText := make([]byte, cipherTextBlockSize)
