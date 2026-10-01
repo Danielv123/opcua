@@ -44,6 +44,15 @@ func newTestRSACertificate(t *testing.T) ua.ByteString {
 	return newTestCertificate(t, &key.PublicKey, key)
 }
 
+func newTestRSACertificateWithKeySize(t *testing.T, bits int) ua.ByteString {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, bits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newTestCertificate(t, &key.PublicKey, key)
+}
+
 func newTestECDSACertificate(t *testing.T) ua.ByteString {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -56,6 +65,7 @@ func newTestECDSACertificate(t *testing.T) ua.ByteString {
 func testEndpoint(policyURI string, mode ua.MessageSecurityMode, level uint8, cert ua.ByteString, tokens ...ua.UserTokenPolicy) ua.EndpointDescription {
 	return ua.EndpointDescription{
 		EndpointURL:         "opc.tcp://localhost:46310",
+		Server:              ua.ApplicationDescription{ApplicationURI: "urn:testserver"},
 		ServerCertificate:   cert,
 		SecurityMode:        mode,
 		SecurityPolicyURI:   policyURI,
@@ -98,12 +108,14 @@ func newTestClient(t *testing.T, opts ...Option) *Client {
 func TestSelectEndpoint(t *testing.T) {
 	serverCert := newTestRSACertificate(t)
 	ecdsaCert := newTestECDSACertificate(t)
+	weakCert := newTestRSACertificateWithKeySize(t, 1024)
 	clientCert := []byte(newTestRSACertificate(t))
 	withClientCert := WithClientCertificate(clientCert, nil)
 	withUserName := WithUserNameIdentity("user", "password")
 
 	const (
 		none   = ua.SecurityPolicyURINone
+		b128   = ua.SecurityPolicyURIBasic128Rsa15
 		b256   = ua.SecurityPolicyURIBasic256Sha256
 		aes256 = ua.SecurityPolicyURIAes256Sha256RsaPss
 	)
@@ -377,11 +389,102 @@ func TestSelectEndpoint(t *testing.T) {
 			wantErr: ua.BadCertificateInvalid,
 		},
 		{
-			name: "secured endpoint without server certificate is skipped for next secured endpoint",
+			// an attacker may remove the certificate of the strongest endpoint to force a weaker one.
+			name: "secured endpoint without server certificate fails rather than falling back to weaker endpoint",
 			opts: []Option{withClientCert, withUserName},
 			endpoints: []ua.EndpointDescription{
 				testEndpoint(aes256, ua.MessageSecurityModeSignAndEncrypt, 6, "", userNameToken("user_0", aes256)),
 				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 5, serverCert, userNameToken("user_1", b256)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "secured endpoint without server certificate fails after skipping endpoint without identity",
+			opts: []Option{withClientCert, withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(aes256, ua.MessageSecurityModeSignAndEncrypt, 7, serverCert, anonymousToken("anon_0")),
+				testEndpoint(aes256, ua.MessageSecurityModeSign, 6, "", userNameToken("user_1", aes256)),
+				testEndpoint(b256, ua.MessageSecurityModeSign, 5, serverCert, userNameToken("user_2", b256)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "secured endpoint without server certificate ranked below selected endpoint is ignored",
+			opts: []Option{withClientCert, withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(aes256, ua.MessageSecurityModeSignAndEncrypt, 6, serverCert, userNameToken("user_0", aes256)),
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 5, "", userNameToken("user_1", b256)),
+			},
+			wantPolicy: aes256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "user_0",
+		},
+		{
+			name: "secured endpoint with weak RSA key is rejected",
+			opts: []Option{withClientCert},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 5, weakCert, anonymousToken("anon_0")),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "1024-bit RSA key is accepted by Basic128Rsa15",
+			opts: []Option{withClientCert},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b128, ua.MessageSecurityModeSignAndEncrypt, 5, weakCert, anonymousToken("anon_0")),
+			},
+			wantPolicy: b128, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "anon_0",
+		},
+		{
+			name: "token encryption requires the key size of the token policy",
+			opts: []Option{withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, weakCert, userNameToken("user_0", aes256)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "selects strongest token policy",
+			opts: []Option{withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", b128), userNameToken("user_1", aes256), userNameToken("user_2", b256)),
+			},
+			wantPolicy: none, wantMode: ua.MessageSecurityModeNone, wantToken: "user_1",
+		},
+		{
+			// an attacker may reorder endpoints with equal security level, since the endpoint verification ignores order.
+			name: "equal security level selects strongest mode and policy (strong first)",
+			opts: []Option{withClientCert, withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(aes256, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, userNameToken("user_0", aes256)),
+				testEndpoint(b128, ua.MessageSecurityModeSign, 1, serverCert, userNameToken("user_1", b128)),
+				testEndpoint(aes256, ua.MessageSecurityModeSign, 1, serverCert, userNameToken("user_2", aes256)),
+			},
+			wantPolicy: aes256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "user_0",
+		},
+		{
+			name: "equal security level selects strongest mode and policy (weak first)",
+			opts: []Option{withClientCert, withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b128, ua.MessageSecurityModeSign, 1, serverCert, userNameToken("user_1", b128)),
+				testEndpoint(aes256, ua.MessageSecurityModeSign, 1, serverCert, userNameToken("user_2", aes256)),
+				testEndpoint(aes256, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, userNameToken("user_0", aes256)),
+			},
+			wantPolicy: aes256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "user_0",
+		},
+		{
+			name: "equal rank selects strongest token policy (weak first)",
+			opts: []Option{withClientCert, withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, userNameToken("user_0", b128)),
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, userNameToken("user_1", aes256)),
+			},
+			wantPolicy: b256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "user_1",
+		},
+		{
+			name: "equal rank selects strongest token policy (strong first)",
+			opts: []Option{withClientCert, withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, userNameToken("user_1", aes256)),
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, userNameToken("user_0", b128)),
 			},
 			wantPolicy: b256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "user_1",
 		},
@@ -467,11 +570,37 @@ func TestVerifyServerEndpoints(t *testing.T) {
 	}
 
 	tests := []struct {
-		name    string
-		modify  func([]ua.EndpointDescription) []ua.EndpointDescription
-		wantErr bool
+		name            string
+		modify          func([]ua.EndpointDescription) []ua.EndpointDescription // modifies the endpoints returned by CreateSession
+		modifyDiscovery func([]ua.EndpointDescription) []ua.EndpointDescription // modifies the endpoints returned by discovery
+		wantErr         bool
 	}{
 		{name: "identical", modify: func(eps []ua.EndpointDescription) []ua.EndpointDescription { return eps }},
+		{name: "token policies reordered", modify: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
+			for i := range eps {
+				t := eps[i].UserIdentityTokens
+				t[0], t[1] = t[1], t[0]
+			}
+			return eps
+		}},
+		{name: "application uri omitted", modify: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
+			for i := range eps {
+				eps[i].Server.ApplicationURI = ""
+			}
+			return eps
+		}},
+		{name: "application uri changed", wantErr: true, modify: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
+			eps[1].Server.ApplicationURI = "urn:other"
+			return eps
+		}},
+		{name: "certificate stripped from discovery", wantErr: true, modifyDiscovery: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
+			eps[2].ServerCertificate = ""
+			return eps
+		}},
+		{name: "transport profile changed", wantErr: true, modify: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
+			eps[2].TransportProfileURI = ""
+			return eps
+		}},
 		{name: "reordered", modify: func(eps []ua.EndpointDescription) []ua.EndpointDescription {
 			return []ua.EndpointDescription{eps[2], eps[0], eps[1]}
 		}},
@@ -526,7 +655,14 @@ func TestVerifyServerEndpoints(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := verifyServerEndpoints(discovered, tt.modify(clone()))
+			discovery, session := clone(), clone()
+			if tt.modifyDiscovery != nil {
+				discovery = tt.modifyDiscovery(discovery)
+			}
+			if tt.modify != nil {
+				session = tt.modify(session)
+			}
+			err := verifyServerEndpoints(discovery, session)
 			if tt.wantErr && err != ua.BadSecurityChecksFailed {
 				t.Errorf("verifyServerEndpoints() error = %v, want %v", err, ua.BadSecurityChecksFailed)
 			}

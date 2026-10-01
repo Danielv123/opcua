@@ -670,4 +670,31 @@ func TestDialDetectsStrippedEndpointsOnSecureChannel(t *testing.T) {
 			t.Errorf("client made %d connections, want 2", n)
 		}
 	})
+
+	t.Run("certificate stripped from strongest endpoint is rejected", func(t *testing.T) {
+		modified := make([]ua.EndpointDescription, len(res.Endpoints))
+		copy(modified, res.Endpoints)
+		for i := range modified {
+			if modified[i].SecurityPolicyURI == ua.SecurityPolicyURIAes256Sha256RsaPss && modified[i].SecurityMode == ua.MessageSecurityModeSignAndEncrypt {
+				modified[i].ServerCertificate = ""
+			}
+		}
+		srv := &fakeServer{discoveryEndpoints: modified, forwardAddr: forwardAddr}
+		srv.start(t)
+		ch, err := client.Dial(ctx, srv.endpointURL,
+			client.WithClientCertificatePaths("./pki/client.crt", "./pki/client.key"),
+			client.WithInsecureSkipVerify(),
+			client.WithUserNameIdentity("root", "secret"),
+		)
+		if err == nil {
+			ch.Abort(ctx)
+			t.Fatal("Dial succeeded, want error")
+		}
+		if err != ua.BadCertificateInvalid {
+			t.Errorf("Dial error = %v, want %v", err, ua.BadCertificateInvalid)
+		}
+		if n := srv.connections(); n != 1 {
+			t.Errorf("client made %d connections, want only the discovery connection", n)
+		}
+	})
 }
