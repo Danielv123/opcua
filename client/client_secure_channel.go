@@ -276,6 +276,15 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		return err
 	}
 
+	// a secured channel must be authenticated with the server certificate.
+	switch ch.securityMode {
+	case ua.MessageSecurityModeSignAndEncrypt, ua.MessageSecurityModeSign:
+		if len(ch.remoteCertificate) == 0 {
+			return ua.BadCertificateInvalid
+		}
+	}
+
+	// validate the server certificate whenever one is used, either to secure the channel or to encrypt the user token.
 	if len(ch.remoteCertificate) > 0 {
 		certs, err := x509.ParseCertificates(ch.remoteCertificate)
 		if err != nil || len(certs) == 0 {

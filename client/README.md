@@ -78,3 +78,31 @@ func ExampleClient_Read() {
 
 
 ```
+
+## Security
+Dial first asks the server for its endpoint descriptions (GetEndpoints). That request uses an unsecured channel, so an attacker on the network path can change the response, for example to remove the secure endpoints or to ask for the password without encryption. Dial therefore only uses the response to choose among endpoints that meet the client's own requirements, and checks it again once the channel is secured:
+
+- **Endpoint selection.** With `WithSecurityPolicyURI`, Dial connects only to an endpoint with the requested policy and mode. If the server does not offer one, Dial fails with `BadSecurityModeRejected` instead of connecting to a weaker endpoint. A Sign or SignAndEncrypt endpoint requires a client certificate.
+- **Minimum security mode.** `WithMinSecurityMode(mode)` sets the weakest MessageSecurityMode Dial will accept. Dial never selects an endpoint below it and fails with `BadSecurityModeRejected` if no endpoint meets it. If you don't set it, the minimum is `MessageSecurityModeSign` when a client certificate is set, the user identity is a UserName, Issued or X509 identity, and the endpoint is selected automatically. Otherwise the minimum is `MessageSecurityModeNone`.
+- **Credentials are never sent in plaintext.** A UserName password or an IssuedIdentity token is sent only if it is encrypted with the server certificate (the user token policy has a security policy other than None), or if the channel is SignAndEncrypt. Otherwise Dial fails with `BadSecurityModeInsufficient` before any credential bytes are sent. A token policy with an unsupported security policy is never used. `WithInsecurePlaintextCredentials()` explicitly allows plaintext credentials, for example for a legacy server on a trusted network.
+- **Server certificate validation.** A secured endpoint without a valid RSA server certificate is rejected (`BadCertificateInvalid`). The server certificate is checked against the trusted certificates (`WithTrustedCertificatesPaths`) whenever it is used, whether to secure the channel or to encrypt a user token on a None channel. Otherwise an attacker could swap in their own certificate. `WithInsecureSkipVerify()` turns this check off. Use it only for testing: an attacker can then impersonate the server and receive credentials encrypted with the attacker's certificate.
+- **Endpoint verification.** As required by OPC UA Part 4, 5.6.2, the client checks that the endpoints returned by CreateSession match the endpoints returned by discovery, comparing security mode, security policy, security level, user token policies and server certificate. It also checks that the server certificate matches the certificate of the secure channel. If they differ, Dial fails with `BadSecurityChecksFailed` before ActivateSession, so no credentials are sent. When the channel is secured, the CreateSession response is authenticated, so this check detects a discovery response that was altered.
+
+For example, to require an encrypted channel and authenticate the server with a trusted certificate:
+
+```go
+ch, err := client.Dial(
+	ctx,
+	"opc.tcp://myserver:4840",
+	client.WithClientCertificatePaths("./pki/client.crt", "./pki/client.key"),
+	client.WithTrustedCertificatesPaths("./pki/trusted/certs", "./pki/trusted/crl"),
+	client.WithMinSecurityMode(ua.MessageSecurityModeSignAndEncrypt),
+	client.WithUserNameIdentity("user", "password"),
+)
+```
+
+### Migrating from earlier versions
+- If a server only offers a user token policy with security policy None on an endpoint that is not SignAndEncrypt, Dial with a UserName or Issued identity now fails with `BadSecurityModeInsufficient`. Use a secure endpoint, or add `client.WithInsecurePlaintextCredentials()` to keep the old behavior.
+- If you set a client certificate and a UserName, Issued or X509 identity, and let Dial select the endpoint, Dial no longer connects to a None endpoint. If the server only offers None endpoints, add `client.WithMinSecurityMode(ua.MessageSecurityModeNone)` or request the endpoint explicitly with `client.WithSecurityPolicyURI(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone)`.
+- `WithSecurityPolicyURI("", ua.MessageSecurityModeSign)` or `WithSecurityPolicyURI("", ua.MessageSecurityModeSignAndEncrypt)` without a client certificate now fails with `BadSecurityModeRejected`. Previously it silently connected with security policy None.
+- If the endpoints returned by CreateSession don't match the endpoints returned by GetEndpoints, Dial now fails with `BadSecurityChecksFailed`.
