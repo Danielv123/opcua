@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -101,24 +102,37 @@ func (srv *Server) handleCreateSession(ch *serverSecureChannel, requestid uint32
 		ch.Abort(ua.BadSecurityPolicyRejected, "")
 		return nil
 	}
-	// check nonce
-	switch ch.SecurityPolicyURI() {
-	case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256, ua.SecurityPolicyURIBasic256Sha256,
-		ua.SecurityPolicyURIAes128Sha256RsaOaep, ua.SecurityPolicyURIAes256Sha256RsaPss:
-
-		// check client application uri matches one of the client certificate's san.
-		valid := false
-		if appuri := req.ClientDescription.ApplicationURI; appuri != "" {
-			if crts, err := x509.ParseCertificates([]byte(req.ClientCertificate)); err == nil && len(crts) > 0 {
-				for _, crturi := range crts[0].URIs {
-					if crturi.String() == appuri {
-						valid = true
-						break
-					}
-				}
-			}
+	// check client certificate is the certificate authenticated by the secure channel.
+	clientCertificate, _, ok := verifiedClientCertificate(ch)
+	if ok && clientCertificate != nil {
+		crts, err := x509.ParseCertificates([]byte(req.ClientCertificate))
+		ok = err == nil && len(crts) > 0 && crts[0].Equal(clientCertificate)
+	}
+	if !ok {
+		srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
+		srv.serverDiagnosticsSummary.RejectedSessionCount++
+		srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
+		srv.serverDiagnosticsSummary.RejectedRequestsCount++
+		err := ch.Write(
+			&ua.ServiceFault{
+				ResponseHeader: ua.ResponseHeader{
+					Timestamp:     time.Now(),
+					RequestHandle: req.RequestHandle,
+					ServiceResult: ua.BadCertificateInvalid,
+				},
+			},
+			requestid,
+		)
+		if err != nil {
+			return err
 		}
-		if !valid {
+		return nil
+	}
+	// check client application uri matches the uri of the client certificate's san, which shall have
+	// exactly one absolute uri. without security, the client application uri cannot be verified.
+	var verifiedApplicationURI string
+	if clientCertificate != nil {
+		if len(clientCertificate.URIs) != 1 || !clientCertificate.URIs[0].IsAbs() || clientCertificate.URIs[0].String() != req.ClientDescription.ApplicationURI {
 			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
 			srv.serverDiagnosticsSummary.RejectedSessionCount++
 			srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
@@ -138,6 +152,13 @@ func (srv *Server) handleCreateSession(ch *serverSecureChannel, requestid uint32
 			}
 			return nil
 		}
+		verifiedApplicationURI = clientCertificate.URIs[0].String()
+	}
+	// check nonce
+	switch ch.SecurityPolicyURI() {
+	case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256, ua.SecurityPolicyURIBasic256Sha256,
+		ua.SecurityPolicyURIAes128Sha256RsaOaep, ua.SecurityPolicyURIAes256Sha256RsaPss:
+
 		if len(req.ClientNonce) < int(nonceLength) {
 			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
 			srv.serverDiagnosticsSummary.RejectedSessionCount++
@@ -220,6 +241,10 @@ func (srv *Server) handleCreateSession(ch *serverSecureChannel, requestid uint32
 	if sessionTimeout > maxSessionTimeout {
 		sessionTimeout = maxSessionTimeout
 	}
+	var sessionCertificate ua.ByteString
+	if clientCertificate != nil {
+		sessionCertificate = ua.ByteString(clientCertificate.Raw)
+	}
 	session := NewSession(
 		srv,
 		ua.NewNodeIDOpaque(1, ua.ByteString(getNextNonce(15))),
@@ -230,9 +255,11 @@ func (srv *Server) handleCreateSession(ch *serverSecureChannel, requestid uint32
 		req.ClientDescription,
 		req.ServerURI,
 		req.EndpointURL,
-		req.ClientCertificate,
+		sessionCertificate,
 		req.MaxResponseMessageSize,
 	)
+	session.verifiedApplicationURI = verifiedApplicationURI
+	session.createChannelId = ch.ChannelID()
 	err := srv.SessionManager().Add(session)
 	if err != nil {
 		srv.serverDiagnosticsSummary.RejectedSessionCount++
@@ -311,7 +338,64 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 		return nil
 	}
 
-	// verify the client's signature.
+	// the first activation must use the secure channel that created the session.
+	sessionChannelID := session.SecureChannelId()
+	if sessionChannelID == 0 && session.createChannelId != ch.ChannelID() {
+		srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
+		srv.serverDiagnosticsSummary.RejectedSessionCount++
+		srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
+		srv.serverDiagnosticsSummary.RejectedRequestsCount++
+		err := ch.Write(
+			&ua.ServiceFault{
+				ResponseHeader: ua.ResponseHeader{
+					Timestamp:     time.Now(),
+					RequestHandle: req.RequestHandle,
+					ServiceResult: ua.BadSecureChannelIDInvalid,
+				},
+			},
+			requestid,
+		)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// the secure channel must be authenticated with the client certificate of the session. once activated,
+	// the session may be transferred to a new secure channel with the same security policy and mode.
+	clientCertificate, clientKey, ok := verifiedClientCertificate(ch)
+	if ok {
+		var raw []byte
+		if clientCertificate != nil {
+			raw = clientCertificate.Raw
+		}
+		ok = bytes.Equal(raw, []byte(session.ClientCertificate()))
+	}
+	if ok && sessionChannelID != 0 {
+		ok = ch.SecurityPolicyURI() == session.SecurityPolicyURI() && ch.SecurityMode() == session.SecurityMode()
+	}
+	if !ok {
+		srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
+		srv.serverDiagnosticsSummary.RejectedSessionCount++
+		srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
+		srv.serverDiagnosticsSummary.RejectedRequestsCount++
+		err := ch.Write(
+			&ua.ServiceFault{
+				ResponseHeader: ua.ResponseHeader{
+					Timestamp:     time.Now(),
+					RequestHandle: req.RequestHandle,
+					ServiceResult: ua.BadSecurityChecksFailed,
+				},
+			},
+			requestid,
+		)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// verify the client's signature with the client certificate of the session.
 	var err error
 	switch ch.SecurityPolicyURI() {
 	case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256:
@@ -319,21 +403,21 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 		hash.Write(srv.LocalCertificate())
 		hash.Write([]byte(session.SessionNonce()))
 		hashed := hash.Sum(nil)
-		err = rsa.VerifyPKCS1v15(ch.RemotePublicKey(), crypto.SHA1, hashed, []byte(req.ClientSignature.Signature))
+		err = rsa.VerifyPKCS1v15(clientKey, crypto.SHA1, hashed, []byte(req.ClientSignature.Signature))
 
 	case ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep:
 		hash := crypto.SHA256.New()
 		hash.Write(srv.LocalCertificate())
 		hash.Write([]byte(session.SessionNonce()))
 		hashed := hash.Sum(nil)
-		err = rsa.VerifyPKCS1v15(ch.RemotePublicKey(), crypto.SHA256, hashed, []byte(req.ClientSignature.Signature))
+		err = rsa.VerifyPKCS1v15(clientKey, crypto.SHA256, hashed, []byte(req.ClientSignature.Signature))
 
 	case ua.SecurityPolicyURIAes256Sha256RsaPss:
 		hash := crypto.SHA256.New()
 		hash.Write(srv.LocalCertificate())
 		hash.Write([]byte(session.SessionNonce()))
 		hashed := hash.Sum(nil)
-		err = rsa.VerifyPSS(ch.RemotePublicKey(), crypto.SHA256, hashed, []byte(req.ClientSignature.Signature), &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+		err = rsa.VerifyPSS(clientKey, crypto.SHA256, hashed, []byte(req.ClientSignature.Signature), &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
 	}
 	if err != nil {
 		srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
@@ -789,28 +873,28 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 	switch id := userIdentity.(type) {
 	case ua.AnonymousIdentity:
 		if auth := srv.anonymousIdentityAuthenticator; auth != nil {
-			err = auth.AuthenticateAnonymousIdentity(id, session.clientDescription.ApplicationURI, ch.localEndpoint.EndpointURL)
+			err = auth.AuthenticateAnonymousIdentity(id, session.verifiedApplicationURI, ch.localEndpoint.EndpointURL)
 		} else {
 			err = ua.BadIdentityTokenRejected
 		}
 
 	case ua.UserNameIdentity:
 		if auth := srv.userNameIdentityAuthenticator; auth != nil {
-			err = auth.AuthenticateUserNameIdentity(id, session.clientDescription.ApplicationURI, session.endpointURL)
+			err = auth.AuthenticateUserNameIdentity(id, session.verifiedApplicationURI, session.endpointURL)
 		} else {
 			err = ua.BadIdentityTokenRejected
 		}
 
 	case ua.X509Identity:
 		if auth := srv.x509IdentityAuthenticator; auth != nil {
-			err = auth.AuthenticateX509Identity(id, session.clientDescription.ApplicationURI, session.endpointURL)
+			err = auth.AuthenticateX509Identity(id, session.verifiedApplicationURI, session.endpointURL)
 		} else {
 			err = ua.BadIdentityTokenRejected
 		}
 
 	case ua.IssuedIdentity:
 		if auth := srv.issuedIdentityAuthenticator; auth != nil {
-			err = auth.AuthenticateIssuedIdentity(id, session.clientDescription.ApplicationURI, session.endpointURL)
+			err = auth.AuthenticateIssuedIdentity(id, session.verifiedApplicationURI, session.endpointURL)
 		} else {
 			err = ua.BadIdentityTokenRejected
 		}
@@ -845,6 +929,37 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 			return err
 		}
 		return nil
+	}
+
+	// a session transferred to a new secure channel must keep its user. an anonymous session
+	// must not be transferred to a secure channel that only signs messages.
+	if sessionChannelID != 0 && sessionChannelID != ch.ChannelID() {
+		statusCode := ua.Good
+		if _, ok := userIdentity.(ua.AnonymousIdentity); ok && ch.SecurityMode() == ua.MessageSecurityModeSign {
+			statusCode = ua.BadSecurityModeInsufficient
+		} else if !sameClientUserID(session.UserIdentity(), userIdentity) {
+			statusCode = ua.BadIdentityChangeNotSupported
+		}
+		if statusCode != ua.Good {
+			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
+			srv.serverDiagnosticsSummary.RejectedSessionCount++
+			srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
+			srv.serverDiagnosticsSummary.RejectedRequestsCount++
+			err = ch.Write(
+				&ua.ServiceFault{
+					ResponseHeader: ua.ResponseHeader{
+						Timestamp:     time.Now(),
+						RequestHandle: req.RequestHandle,
+						ServiceResult: statusCode,
+					},
+				},
+				requestid,
+			)
+			if err != nil {
+				return err
+			}
+			return nil
+		}
 	}
 
 	session.SetUserIdentity(userIdentity)
@@ -6256,5 +6371,46 @@ func (srv *Server) readValue(session *Session, readValueId ua.ReadValueID) ua.Da
 		return ua.NewDataValue(s2, ua.Good, time.Time{}, 0, time.Now(), 0)
 	default:
 		return ua.NewDataValue(nil, ua.BadAttributeIDInvalid, time.Time{}, 0, time.Now(), 0)
+	}
+}
+
+// verifiedClientCertificate returns the client certificate and public key that were authenticated by the
+// secure channel. Both are nil if the secure channel does not use security. ok is false if the secure
+// channel uses security but did not authenticate a client certificate with an RSA public key.
+func verifiedClientCertificate(ch *serverSecureChannel) (crt *x509.Certificate, key *rsa.PublicKey, ok bool) {
+	if ch.SecurityMode() == ua.MessageSecurityModeNone && ch.SecurityPolicyURI() == ua.SecurityPolicyURINone {
+		return nil, nil, true
+	}
+	crt = ch.VerifiedRemoteCertificate()
+	if crt == nil {
+		return nil, nil, false
+	}
+	key, ok = crt.PublicKey.(*rsa.PublicKey)
+	if !ok {
+		return nil, nil, false
+	}
+	return crt, key, true
+}
+
+// sameClientUserID returns true if both user identities identify the same user. X509 identities must use
+// the same certificate, since distinct certificates may identify distinct users (e.g. RulesBasedRolesProvider
+// maps certificates by thumbprint, regardless of subject). Issued tokens are not interpreted, so they must be
+// identical. A client that renews its user certificate or token must create a new session.
+func sameClientUserID(a, b any) bool {
+	switch a := a.(type) {
+	case ua.AnonymousIdentity:
+		_, ok := b.(ua.AnonymousIdentity)
+		return ok
+	case ua.UserNameIdentity:
+		b, ok := b.(ua.UserNameIdentity)
+		return ok && a.UserName == b.UserName
+	case ua.X509Identity:
+		b, ok := b.(ua.X509Identity)
+		return ok && len(a.Certificate) > 0 && bytes.Equal([]byte(a.Certificate), []byte(b.Certificate))
+	case ua.IssuedIdentity:
+		b, ok := b.(ua.IssuedIdentity)
+		return ok && len(a.TokenData) > 0 && bytes.Equal([]byte(a.TokenData), []byte(b.TokenData))
+	default:
+		return false
 	}
 }

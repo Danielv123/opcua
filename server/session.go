@@ -41,6 +41,8 @@ type Session struct {
 	securityMode                            ua.MessageSecurityMode
 	securityPolicyURI                       string
 	clientCertificate                       ua.ByteString
+	verifiedApplicationURI                  string
+	createChannelId                         uint32
 	browseCPs                               map[uint32]browseCP
 	lastBrowseCP                            uint32
 	maxBrowseContinuationPoints             int
@@ -116,6 +118,9 @@ type Session struct {
 	clientUserIdHistory                     []string
 }
 
+// NewSession returns a new Session. Sessions are usually created by the CreateSession service, which binds
+// them to the secure channel and client certificate of the client. A Session created with NewSession is not
+// bound to a secure channel, so a client cannot activate it with the ActivateSession service.
 func NewSession(server *Server, sessionId ua.NodeID, sessionName string, authenticationToken ua.NodeID, sessionNonce ua.ByteString, timeout float64, clientDescription ua.ApplicationDescription, serverUri string, endpointUrl string, clientCertificate ua.ByteString, maxResponseMessageSize uint32) *Session {
 	return &Session{
 		sessionId:                    sessionId,
@@ -135,6 +140,7 @@ func NewSession(server *Server, sessionId ua.NodeID, sessionName string, authent
 		clientDescription:            clientDescription,
 		serverUri:                    serverUri,
 		endpointURL:                  endpointUrl,
+		clientCertificate:            clientCertificate,
 		localeIds:                    []string{"en-US"},
 		maxResponseMessageSize:       maxResponseMessageSize,
 		timeCreated:                  time.Now(),

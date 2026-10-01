@@ -52,6 +52,7 @@ type serverSecureChannel struct {
 	localPrivateKey             *rsa.PrivateKey
 	remotePublicKey             *rsa.PublicKey
 	remoteApplicationURI        string
+	verifiedRemoteCertificate   *x509.Certificate
 	localNonce                  []byte
 	remoteNonce                 []byte
 	channelID                   uint32
@@ -139,6 +140,15 @@ func (ch *serverSecureChannel) RemotePublicKey() *rsa.PublicKey {
 	ch.RLock()
 	defer ch.RUnlock()
 	return ch.remotePublicKey
+}
+
+// VerifiedRemoteCertificate gets the certificate of the remote application that was validated
+// when the channel was opened, and whose private key signed the OpenSecureChannel request.
+// Returns nil if the channel was opened without security.
+func (ch *serverSecureChannel) VerifiedRemoteCertificate() *x509.Certificate {
+	ch.RLock()
+	defer ch.RUnlock()
+	return ch.verifiedRemoteCertificate
 }
 
 // ChannelID gets the channel id.
@@ -341,6 +351,10 @@ func (ch *serverSecureChannel) Open() error {
 		ch.remotePublicKey = cert.PublicKey.(*rsa.PublicKey)
 		if len(cert.URIs) > 0 {
 			ch.remoteApplicationURI = cert.URIs[0].String()
+		}
+		if ch.securityPolicyURI != ua.SecurityPolicyURINone {
+			// the request was signed with the private key of the certificate.
+			ch.verifiedRemoteCertificate = cert
 		}
 	}
 
