@@ -1722,44 +1722,55 @@ func split(level, i, j int, dims []int, vals reflect.Value) reflect.Value {
 
 // ReadDiagnosticInfo reads a DiagnosticInfo.
 func (dec *BinaryDecoder) ReadDiagnosticInfo(value *DiagnosticInfo) error {
+	if err := dec.enter(); err != nil {
+		return err
+	}
+	defer dec.leave()
 	result := DiagnosticInfo{}
 	var b byte
 	if err := dec.ReadByte(&b); err != nil {
 		return BadDecodingError
 	}
 	if (b & 1) != 0 {
+		result.SymbolicID = new(int32)
 		if err := dec.ReadInt32(result.SymbolicID); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 2) != 0 {
+		result.NamespaceURI = new(int32)
 		if err := dec.ReadInt32(result.NamespaceURI); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 8) != 0 {
+		result.Locale = new(int32)
 		if err := dec.ReadInt32(result.Locale); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 4) != 0 {
+		result.LocalizedText = new(int32)
 		if err := dec.ReadInt32(result.LocalizedText); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 16) != 0 {
+		result.AdditionalInfo = new(string)
 		if err := dec.ReadString(result.AdditionalInfo); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 32) != 0 {
+		result.InnerStatusCode = new(StatusCode)
 		if err := dec.ReadStatusCode(result.InnerStatusCode); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 64) != 0 {
+		result.InnerDiagnosticInfo = new(DiagnosticInfo)
 		if err := dec.ReadDiagnosticInfo(result.InnerDiagnosticInfo); err != nil {
-			return BadDecodingError
+			return err
 		}
 	}
 	*value = result
