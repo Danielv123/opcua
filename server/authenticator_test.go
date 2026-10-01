@@ -108,6 +108,8 @@ func TestAuthenticatorErrors(t *testing.T) {
 					client.WithSecurityPolicyURI(ua.SecurityPolicyURIBasic256Sha256, ua.MessageSecurityModeSignAndEncrypt),
 					client.WithClientCertificatePaths("./pki/client.crt", "./pki/client.key"),
 				)
+			} else {
+				opts = append(opts, client.WithSecurityPolicyURI(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone))
 			}
 			ch, err := client.Dial(ctx, authEndpointURL, opts...)
 			if err == nil {
@@ -124,6 +126,7 @@ func TestAuthenticatorErrors(t *testing.T) {
 	// the server continues to serve requests.
 	ch, err := client.Dial(ctx, authEndpointURL,
 		client.WithInsecureSkipVerify(),
+		client.WithSecurityPolicyURI(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone),
 		client.WithUserNameIdentity("user", "secret"),
 	)
 	if err != nil {
