@@ -344,3 +344,93 @@ func TestServerChunkReassembly(t *testing.T) {
 		}
 	})
 }
+
+// TestServerAbortChunk checks that an abort chunk is verified like other chunks, and that a valid abort
+// chunk discards the aborted message and keeps the channel open.
+func TestServerAbortChunk(t *testing.T) {
+	loadTestCredentials(t)
+	configs := []struct {
+		p    testPolicy
+		mode ua.MessageSecurityMode
+	}{
+		{testPolicy{ua.SecurityPolicyURINone, new(ua.SecurityPolicyNone)}, ua.MessageSecurityModeNone},
+		{testRSAPolicies[2], ua.MessageSecurityModeSign},
+		{testRSAPolicies[2], ua.MessageSecurityModeSignAndEncrypt},
+	}
+	for _, cfg := range configs {
+		newChannel := func(t *testing.T) (*serverSecureChannel, net.Conn, securechanneltest.SymmetricChunk) {
+			ch, peer := newTestServerChannel(t, testServer)
+			keys := establishTestChannel(ch, cfg.p, cfg.mode)
+			return ch, peer, securechanneltest.SymmetricChunk{
+				ChannelID: ch.channelID, TokenID: 1, Policy: cfg.p.policy, Mode: cfg.mode, Keys: keys,
+			}
+		}
+		chunk := func(c securechanneltest.SymmetricChunk, messageType, sequenceNumber, requestID uint32, body []byte) []byte {
+			c.MessageType, c.SequenceNumber, c.RequestID, c.Body = messageType, sequenceNumber, requestID, body
+			return c.Encode()
+		}
+		abort := securechanneltest.AbortBody(ua.BadRequestTooLarge, "too large")
+		body := testReadRequestBody()
+
+		t.Run(cfg.mode.String()+"/AbortedMessageIsDiscarded", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			req, id, err := readTestRequest(t, ch, peer,
+				chunk(c, ua.MessageTypeChunk, 2, 5, body[:10]),
+				chunk(c, ua.MessageTypeAbort, 3, 5, abort),
+				chunk(c, ua.MessageTypeFinal, 4, 6, body),
+			)
+			if _, ok := req.(*ua.ReadRequest); err != nil || !ok || id != 6 {
+				t.Fatalf("readRequest() = %T, %d, %v, want the request after the aborted message", req, id, err)
+			}
+		})
+		t.Run(cfg.mode.String()+"/AbortOnly", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			req, id, err := readTestRequest(t, ch, peer,
+				chunk(c, ua.MessageTypeAbort, 2, 5, abort),
+				chunk(c, ua.MessageTypeFinal, 3, 6, body),
+			)
+			if _, ok := req.(*ua.ReadRequest); err != nil || !ok || id != 6 {
+				t.Fatalf("readRequest() = %T, %d, %v, want the request after the abort", req, id, err)
+			}
+		})
+		t.Run(cfg.mode.String()+"/ReplayedAbort", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			a := chunk(c, ua.MessageTypeAbort, 2, 5, abort)
+			if _, _, err := readTestRequest(t, ch, peer, a, a); err != ua.BadSequenceNumberInvalid {
+				t.Fatalf("readRequest() = %v, want %v", err, ua.BadSequenceNumberInvalid)
+			}
+		})
+		t.Run(cfg.mode.String()+"/AbortOfOtherRequest", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			if _, _, err := readTestRequest(t, ch, peer,
+				chunk(c, ua.MessageTypeChunk, 2, 5, body[:10]),
+				chunk(c, ua.MessageTypeAbort, 3, 6, abort),
+			); err == nil {
+				t.Fatal("readRequest succeeded")
+			}
+		})
+		t.Run(cfg.mode.String()+"/AbortWithoutReason", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			if _, _, err := readTestRequest(t, ch, peer, chunk(c, ua.MessageTypeAbort, 2, 5, abort[:4])); err == nil {
+				t.Fatal("readRequest succeeded")
+			}
+		})
+		t.Run(cfg.mode.String()+"/TruncatedAbort", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			a := chunk(c, ua.MessageTypeAbort, 2, 5, abort)
+			if _, _, err := readTestRequest(t, ch, peer, setMessageSize(a[:16])); err == nil {
+				t.Fatal("readRequest succeeded")
+			}
+		})
+		if cfg.mode != ua.MessageSecurityModeNone {
+			t.Run(cfg.mode.String()+"/ForgedAbort", func(t *testing.T) {
+				ch, peer, c := newChannel(t)
+				a := chunk(c, ua.MessageTypeAbort, 2, 5, abort)
+				a[len(a)-1] ^= 0x01
+				if _, _, err := readTestRequest(t, ch, peer, a); err != ua.BadSecurityChecksFailed {
+					t.Fatalf("readRequest() = %v, want %v", err, ua.BadSecurityChecksFailed)
+				}
+			})
+		}
+	}
+}

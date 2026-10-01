@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	// maxSequenceNumberBeforeRollover is the sequence number that a sender must reach before it
+	// maxSequenceNumberBeforeRollover is the sequence number that a sender must exceed before it
 	// may roll over to a small sequence number (UInt32.MaxValue - 1024).
 	maxSequenceNumberBeforeRollover uint32 = math.MaxUint32 - 1024
 
@@ -45,7 +45,6 @@ func isNextSequenceNumber(last, next uint32) bool {
 	if next == last+1 {
 		return true
 	}
-	// Rollover. Senders must exceed UInt32.MaxValue - 1024 before rolling over; accepting a
-	// rollover from that value itself also tolerates senders that roll over right after it.
-	return last >= maxSequenceNumberBeforeRollover && next < maxSequenceNumberAfterRollover
+	// Rollover, once the sequence number has exceeded UInt32.MaxValue - 1024.
+	return last > maxSequenceNumberBeforeRollover && next < maxSequenceNumberAfterRollover
 }

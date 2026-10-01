@@ -414,6 +414,95 @@ func TestClientChunkReassembly(t *testing.T) {
 	})
 }
 
+// TestClientAbortChunk checks that an abort chunk is verified like other chunks, and that a valid abort
+// chunk fails the aborted request and keeps the channel open.
+func TestClientAbortChunk(t *testing.T) {
+	loadTestCredentials(t)
+	configs := []struct {
+		p    testPolicy
+		mode ua.MessageSecurityMode
+	}{
+		{testPolicy{ua.SecurityPolicyURINone, new(ua.SecurityPolicyNone)}, ua.MessageSecurityModeNone},
+		{testRSAPolicies[2], ua.MessageSecurityModeSign},
+		{testRSAPolicies[2], ua.MessageSecurityModeSignAndEncrypt},
+	}
+	for _, cfg := range configs {
+		newChannel := func(t *testing.T) (*clientSecureChannel, net.Conn, securechanneltest.SymmetricChunk) {
+			ch, peer, keys := newTestReceivingChannel(t, cfg.p, cfg.mode, testClient, testServer)
+			return ch, peer, securechanneltest.SymmetricChunk{
+				ChannelID: 1, TokenID: 1, Policy: cfg.p.policy, Mode: cfg.mode, Keys: keys,
+			}
+		}
+		chunk := func(c securechanneltest.SymmetricChunk, messageType, sequenceNumber, requestID uint32, body []byte) []byte {
+			c.MessageType, c.SequenceNumber, c.RequestID, c.Body = messageType, sequenceNumber, requestID, body
+			return c.Encode()
+		}
+		abort := securechanneltest.AbortBody(ua.BadResponseTooLarge, "too large")
+		body := testReadResponseBody()
+
+		t.Run(cfg.mode.String()+"/AbortedResponseFailsRequest", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			res, status := readTestResponse(t, ch, peer,
+				chunk(c, ua.MessageTypeChunk, 2, 9, body[:10]),
+				chunk(c, ua.MessageTypeAbort, 3, 9, abort),
+			)
+			if f, ok := res.(*ua.ServiceFault); status != ua.Good || !ok || f.RequestHandle != 9 || f.ServiceResult != ua.BadResponseTooLarge {
+				t.Fatalf("readResponse() = %#v, %v, want a fault for request 9", res, status)
+			}
+			// the channel remains open.
+			res, status = readTestResponse(t, ch, peer, chunk(c, ua.MessageTypeFinal, 4, 7, body))
+			if r, ok := res.(*ua.ReadResponse); status != ua.Good || !ok || r.RequestHandle != 7 {
+				t.Fatalf("readResponse() = %T, %v, want the response after the abort", res, status)
+			}
+		})
+		t.Run(cfg.mode.String()+"/AbortWithGoodStatus", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			res, status := readTestResponse(t, ch, peer, chunk(c, ua.MessageTypeAbort, 2, 9, securechanneltest.AbortBody(ua.Good, "")))
+			if f, ok := res.(*ua.ServiceFault); status != ua.Good || !ok || !f.ServiceResult.IsBad() {
+				t.Fatalf("readResponse() = %#v, %v, want a fault with a bad status", res, status)
+			}
+		})
+		t.Run(cfg.mode.String()+"/ReplayedAbort", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			a := chunk(c, ua.MessageTypeAbort, 2, 9, abort)
+			if _, status := readTestResponse(t, ch, peer, a); status != ua.Good {
+				t.Fatalf("readResponse() = %v", status)
+			}
+			if _, status := readTestResponse(t, ch, peer, a); status != ua.BadSequenceNumberInvalid {
+				t.Fatalf("readResponse() = %v, want %v", status, ua.BadSequenceNumberInvalid)
+			}
+		})
+		t.Run(cfg.mode.String()+"/AbortOfOtherRequest", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			if _, status := readTestResponse(t, ch, peer,
+				chunk(c, ua.MessageTypeChunk, 2, 9, body[:10]),
+				chunk(c, ua.MessageTypeAbort, 3, 10, abort),
+			); status == ua.Good {
+				t.Fatal("readResponse succeeded")
+			}
+		})
+		t.Run(cfg.mode.String()+"/TruncatedAbort", func(t *testing.T) {
+			ch, peer, c := newChannel(t)
+			for _, b := range [][]byte{setMessageSize(chunk(c, ua.MessageTypeAbort, 2, 9, abort)[:16]), chunk(c, ua.MessageTypeAbort, 2, 9, abort[:2])} {
+				if _, status := readTestResponse(t, ch, peer, b); status == ua.Good {
+					t.Fatal("readResponse succeeded")
+				}
+				ch, peer, c = newChannel(t)
+			}
+		})
+		if cfg.mode != ua.MessageSecurityModeNone {
+			t.Run(cfg.mode.String()+"/ForgedAbort", func(t *testing.T) {
+				ch, peer, c := newChannel(t)
+				a := chunk(c, ua.MessageTypeAbort, 2, 9, abort)
+				a[len(a)-1] ^= 0x01
+				if _, status := readTestResponse(t, ch, peer, a); status != ua.BadSecurityChecksFailed {
+					t.Fatalf("readResponse() = %v, want %v", status, ua.BadSecurityChecksFailed)
+				}
+			})
+		}
+	}
+}
+
 // TestClientRejectsUnexpectedOpenSecureChannelResponse checks that the client returns an error, instead
 // of panicking, when the server answers an OpenSecureChannel request with another type of response.
 func TestClientRejectsUnexpectedOpenSecureChannelResponse(t *testing.T) {

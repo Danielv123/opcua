@@ -1090,7 +1090,7 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 		}
 
 		switch messageType {
-		case ua.MessageTypeChunk, ua.MessageTypeFinal, ua.MessageTypeCloseFinal:
+		case ua.MessageTypeChunk, ua.MessageTypeFinal, ua.MessageTypeCloseFinal, ua.MessageTypeAbort:
 
 			// header
 			if err := decoder.ReadUInt32(&channelID); err != nil {
@@ -1351,7 +1351,7 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 
 			isFinal = messageType == ua.MessageTypeOpenFinal
 
-		case ua.MessageTypeError, ua.MessageTypeAbort:
+		case ua.MessageTypeError:
 			var statusCode uint32
 			if err := decoder.ReadUInt32(&statusCode); err != nil {
 				return nil, 0, ua.BadDecodingError
@@ -1385,6 +1385,24 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 			return nil, 0, ua.BadDecodingError
 		}
 		id = requestID
+
+		// the client aborted the message: discard its chunks and continue with the next message.
+		if messageType == ua.MessageTypeAbort {
+			abortDecoder := ua.NewBinaryDecoder(bytes.NewReader(ch.receiveBuffer[bodyStart:bodyEnd]), ch)
+			var statusCode uint32
+			if err := abortDecoder.ReadUInt32(&statusCode); err != nil {
+				return nil, 0, ua.BadDecodingError
+			}
+			var message string
+			if err := abortDecoder.ReadString(&message); err != nil {
+				return nil, 0, ua.BadDecodingError
+			}
+			log.Printf("Client aborted request %d. %s %s\n", id, ua.StatusCode(statusCode).Error(), message)
+			bodyStream.Reset()
+			chunkCount = 0
+			isFinal = false
+			continue
+		}
 
 		if _, err := bodyStream.Write(ch.receiveBuffer[bodyStart:bodyEnd]); err != nil {
 			return nil, 0, err

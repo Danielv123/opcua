@@ -266,6 +266,15 @@ func EncodeBody(id ua.NodeID, v any) []byte {
 	return buf.Bytes()
 }
 
+// AbortBody returns the body of an abort chunk (MSGA): the error and the reason.
+func AbortBody(status ua.StatusCode, reason string) []byte {
+	buf := new(bytes.Buffer)
+	enc := ua.NewBinaryEncoder(buf, ua.NewEncodingContext())
+	enc.WriteUInt32(uint32(status))
+	enc.WriteString(reason)
+	return buf.Bytes()
+}
+
 // ReadChunk reads one chunk from r.
 func ReadChunk(r io.Reader) ([]byte, error) {
 	header := make([]byte, 8)

@@ -1432,7 +1432,7 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 		}
 
 		switch messageType {
-		case ua.MessageTypeChunk, ua.MessageTypeFinal:
+		case ua.MessageTypeChunk, ua.MessageTypeFinal, ua.MessageTypeAbort:
 			// header
 			var channelID uint32
 			if err := decoder.ReadUInt32(&channelID); err != nil {
@@ -1594,7 +1594,7 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 
 			isFinal = messageType == ua.MessageTypeOpenFinal
 
-		case ua.MessageTypeError, ua.MessageTypeAbort:
+		case ua.MessageTypeError:
 			var statusCode uint32
 			if err := decoder.ReadUInt32(&statusCode); err != nil {
 				return nil, ua.BadDecodingError
@@ -1627,6 +1627,21 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 			return nil, ua.BadDecodingError
 		}
 		id = requestID
+
+		// the server aborted the response: discard its chunks and fail the request with the given error.
+		if messageType == ua.MessageTypeAbort {
+			abortDecoder := ua.NewBinaryDecoder(bytes.NewReader(receiveBuffer[bodyStart:bodyEnd]), ch)
+			var statusCode uint32
+			if err := abortDecoder.ReadUInt32(&statusCode); err != nil {
+				return nil, ua.BadDecodingError
+			}
+			result := ua.StatusCode(statusCode)
+			if !result.IsBad() {
+				result = ua.BadUnexpectedError
+			}
+			// the client uses the request handle as request id.
+			return &ua.ServiceFault{ResponseHeader: ua.ResponseHeader{Timestamp: time.Now(), RequestHandle: requestID, ServiceResult: result}}, ua.Good
+		}
 
 		if _, err := bodyStream.Write(receiveBuffer[bodyStart:bodyEnd]); err != nil {
 			return nil, ua.BadTCPInternalError
