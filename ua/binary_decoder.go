@@ -79,7 +79,7 @@ type BinaryDecoder struct {
 	// sampledAt is the value of read when sampledLen was sampled, or -1.
 	sampledAt int64
 	// limit is the value of read at the end of the ExtensionObject body being
-	// decoded, or math.MaxInt64.
+	// decoded, or math.MaxInt64. While a body is decoded, r is limited to it.
 	limit int64
 	// reserved is the memory allocated for the arrays being decoded before their
 	// elements were decoded.
@@ -108,26 +108,18 @@ func NewBinaryDecoder(r io.Reader, ec EncodingContext) *BinaryDecoder {
 	return dec
 }
 
-// readFull reads exactly len(p) bytes.
+// readFull reads exactly len(p) bytes. Callers return BadDecodingError for any error.
 func (dec *BinaryDecoder) readFull(p []byte) error {
-	if int64(len(p)) > dec.limit-dec.read {
-		return BadDecodingError
-	}
-	n, err := io.ReadFull(dec.r, p)
+	// io.ReadAtLeast rather than io.ReadFull, so that this function can be inlined.
+	n, err := io.ReadAtLeast(dec.r, p, len(p))
 	dec.read += int64(n)
-	if err != nil {
-		return BadDecodingError
-	}
-	return nil
+	return err
 }
 
 // skip reads and discards n bytes.
 func (dec *BinaryDecoder) skip(n int64) error {
 	if n <= 0 {
 		return nil
-	}
-	if n > dec.limit-dec.read {
-		return BadDecodingError
 	}
 	m, err := io.CopyN(io.Discard, dec.r, n)
 	dec.read += m
@@ -206,7 +198,7 @@ func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
 	if rem >= 0 || n <= maxPreallocBytes {
 		bs := make([]byte, n)
 		if err := dec.readFull(bs); err != nil {
-			return nil, err
+			return nil, BadDecodingError
 		}
 		return bs, nil
 	}
@@ -219,7 +211,7 @@ func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
 		}
 		m := min(cap(bs), n)
 		if err := dec.readFull(bs[len(bs):m]); err != nil {
-			return nil, err
+			return nil, BadDecodingError
 		}
 		bs = bs[:m]
 	}
@@ -1108,17 +1100,17 @@ func (dec *BinaryDecoder) readExtensionObject(value *ExtensionObject) error {
 				return BadDecodingError
 			}
 			// decode the body within its length.
-			outer := dec.limit
-			end := dec.read + int64(length)
-			dec.limit = end
+			outerR, outerLimit := dec.r, dec.limit
+			dec.r = &io.LimitedReader{R: outerR, N: int64(length)}
+			dec.limit = dec.read + int64(length)
 			obj := reflect.New(typ).Elem().Interface() // TODO: decide if ptr or struct
 			err = dec.Decode(obj)
-			dec.limit = outer
-			if err != nil {
-				return BadDecodingError
+			if err == nil {
+				// skip the rest of the body, such as fields of a later version of the type.
+				err = dec.skip(dec.limit - dec.read)
 			}
-			// skip the rest of the body, such as fields of a later version of the type.
-			if err := dec.skip(end - dec.read); err != nil {
+			dec.r, dec.limit = outerR, outerLimit
+			if err != nil {
 				return BadDecodingError
 			}
 			*value = obj
