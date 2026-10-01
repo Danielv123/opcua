@@ -5,8 +5,10 @@ package client_test
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/binary"
@@ -40,11 +42,12 @@ type fakeServer struct {
 	ln          net.Listener
 	endpointURL string
 
-	mu       sync.Mutex
-	conns    int
-	received bytes.Buffer // all bytes received from clients
-	requests []string     // names of the service requests handled
-	tokens   []any        // user identity tokens received in ActivateSession
+	mu              sync.Mutex
+	conns           int
+	received        bytes.Buffer       // all bytes received from clients
+	requests        []string           // names of the service requests handled
+	tokens          []any              // user identity tokens received in ActivateSession
+	tokenSignatures []ua.SignatureData // user token signatures received in ActivateSession
 }
 
 type fakeEncodingContext struct{}
@@ -233,6 +236,7 @@ func (s *fakeServer) handle(conn net.Conn) {
 				}
 				s.mu.Lock()
 				s.tokens = append(s.tokens, req.UserIdentityToken)
+				s.tokenSignatures = append(s.tokenSignatures, req.UserTokenSignature)
 				s.mu.Unlock()
 				name, resID = "ActivateSession", ua.ObjectIDActivateSessionResponseEncodingDefaultBinary
 				res = &ua.ActivateSessionResponse{
@@ -611,6 +615,64 @@ func TestDialComparesCreateSessionCertificateByLeaf(t *testing.T) {
 	}
 }
 
+// TestDialSignsCreateSessionCertificate verifies that the user token signature is calculated over the server
+// certificate returned by CreateSession, when discovery returned the same leaf certificate with or without its chain.
+func TestDialSignsCreateSessionCertificate(t *testing.T) {
+	leaf, leafPath := newServerCertificate(t)
+	issuer, _ := newServerCertificate(t)
+	userKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userTemplate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "user"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	userCert, err := x509.CreateCertificate(rand.Reader, &userTemplate, &userTemplate, &userKey.PublicKey, userKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	tests := []struct {
+		name                 string
+		discoveryCertificate ua.ByteString
+		sessionCertificate   ua.ByteString
+	}{
+		{name: "chain in discovery, leaf from CreateSession", discoveryCertificate: leaf + issuer, sessionCertificate: leaf},
+		{name: "leaf in discovery, chain from CreateSession", discoveryCertificate: leaf, sessionCertificate: leaf + issuer},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := fakeEndpoint(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone, 0, tt.discoveryCertificate,
+				ua.UserTokenPolicy{PolicyID: "x509", TokenType: ua.UserTokenTypeCertificate, SecurityPolicyURI: ua.SecurityPolicyURIBasic256Sha256})
+			srv := &fakeServer{discoveryEndpoints: []ua.EndpointDescription{e}, sessionEndpoints: []ua.EndpointDescription{e}, serverCertificate: tt.sessionCertificate}
+			srv.start(t)
+			ch, err := client.Dial(ctx, srv.endpointURL,
+				client.WithX509Identity(userCert, userKey),
+				client.WithMinSecurityMode(ua.MessageSecurityModeNone),
+				client.WithTrustedCertificatesPaths(leafPath, ""),
+			)
+			if err != nil {
+				t.Fatalf("Dial error = %v", err)
+			}
+			ch.Close(ctx)
+			srv.mu.Lock()
+			defer srv.mu.Unlock()
+			if len(srv.tokenSignatures) != 1 {
+				t.Fatalf("server received %d token signatures, want 1", len(srv.tokenSignatures))
+			}
+			hashed := sha256.Sum256(append([]byte(tt.sessionCertificate), bytes.Repeat([]byte{1}, 32)...)) // server nonce of fakeServer
+			if err := rsa.VerifyPKCS1v15(&userKey.PublicKey, crypto.SHA256, hashed[:], []byte(srv.tokenSignatures[0].Signature)); err != nil {
+				t.Errorf("token signature is not calculated over the CreateSession certificate: %v", err)
+			}
+		})
+	}
+}
+
 // TestDialRejectsSecuredEndpointWithoutCertificate verifies that a secured endpoint, or a user token policy that
 // requires encryption, without a server certificate is rejected rather than skipping certificate validation.
 func TestDialRejectsSecuredEndpointWithoutCertificate(t *testing.T) {
@@ -720,6 +782,29 @@ func TestDialDetectsStrippedEndpointsOnSecureChannel(t *testing.T) {
 		}
 		if ch.SecurityMode() != ua.MessageSecurityModeSignAndEncrypt {
 			t.Errorf("SecurityMode = %s, want %s", ch.SecurityMode(), ua.MessageSecurityModeSignAndEncrypt)
+		}
+		if err := ch.Close(ctx); err != nil {
+			ch.Abort(ctx)
+		}
+	})
+
+	t.Run("certificate chain added to discovery succeeds", func(t *testing.T) {
+		// the client signature is calculated over the certificate returned by CreateSession, which is the leaf.
+		extra, _ := newServerCertificate(t)
+		modified := make([]ua.EndpointDescription, len(res.Endpoints))
+		copy(modified, res.Endpoints)
+		for i := range modified {
+			modified[i].ServerCertificate += extra
+		}
+		srv := &fakeServer{discoveryEndpoints: modified, forwardAddr: forwardAddr}
+		srv.start(t)
+		ch, err := client.Dial(ctx, srv.endpointURL,
+			client.WithClientCertificatePaths("./pki/client.crt", "./pki/client.key"),
+			client.WithInsecureSkipVerify(),
+			client.WithUserNameIdentity("root", "secret"),
+		)
+		if err != nil {
+			t.Fatalf("Dial error = %v", err)
 		}
 		if err := ch.Close(ctx); err != nil {
 			ch.Abort(ctx)

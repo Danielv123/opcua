@@ -246,6 +246,8 @@ func (ch *Client) open(ctx context.Context) error {
 	if !sameLeafCertificate(ua.ByteString(ch.serverCertificate), createSessionResponse.ServerCertificate) {
 		return ua.BadCertificateInvalid
 	}
+	// the client and user token signatures are calculated over the certificate returned by CreateSession.
+	serverCertificate := []byte(createSessionResponse.ServerCertificate)
 
 	// verify the server's endpoints are the same as the endpoints from discovery, to detect a
 	// discovery response that was altered to downgrade the security of the connection.
@@ -291,7 +293,7 @@ func (ch *Client) open(ctx context.Context) error {
 	switch ch.securityPolicyURI {
 	case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256:
 		hash := crypto.SHA1.New()
-		hash.Write(ch.serverCertificate)
+		hash.Write(serverCertificate)
 		hash.Write(remoteNonce)
 		hashed := hash.Sum(nil)
 		signature, err := rsa.SignPKCS1v15(rand.Reader, ch.channel.localPrivateKey, crypto.SHA1, hashed)
@@ -305,7 +307,7 @@ func (ch *Client) open(ctx context.Context) error {
 
 	case ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep:
 		hash := crypto.SHA256.New()
-		hash.Write(ch.serverCertificate)
+		hash.Write(serverCertificate)
 		hash.Write(remoteNonce)
 		hashed := hash.Sum(nil)
 		signature, err := rsa.SignPKCS1v15(rand.Reader, ch.channel.localPrivateKey, crypto.SHA256, hashed)
@@ -319,7 +321,7 @@ func (ch *Client) open(ctx context.Context) error {
 
 	case ua.SecurityPolicyURIAes256Sha256RsaPss:
 		hash := crypto.SHA256.New()
-		hash.Write(ch.serverCertificate)
+		hash.Write(serverCertificate)
 		hash.Write(remoteNonce)
 		hashed := hash.Sum(nil)
 		signature, err := rsa.SignPSS(rand.Reader, ch.channel.localPrivateKey, crypto.SHA256, hashed, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
@@ -475,7 +477,7 @@ func (ch *Client) open(ctx context.Context) error {
 		switch secPolicyURI {
 		case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256:
 			hash := crypto.SHA1.New()
-			hash.Write(ch.serverCertificate)
+			hash.Write(serverCertificate)
 			hash.Write(remoteNonce)
 			hashed := hash.Sum(nil)
 			signature, err := rsa.SignPKCS1v15(rand.Reader, ui.Key, crypto.SHA1, hashed)
@@ -493,7 +495,7 @@ func (ch *Client) open(ctx context.Context) error {
 
 		case ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep:
 			hash := crypto.SHA256.New()
-			hash.Write(ch.serverCertificate)
+			hash.Write(serverCertificate)
 			hash.Write(remoteNonce)
 			hashed := hash.Sum(nil)
 			signature, err := rsa.SignPKCS1v15(rand.Reader, ui.Key, crypto.SHA256, hashed)
@@ -511,7 +513,7 @@ func (ch *Client) open(ctx context.Context) error {
 
 		case ua.SecurityPolicyURIAes256Sha256RsaPss:
 			hash := crypto.SHA256.New()
-			hash.Write(ch.serverCertificate)
+			hash.Write(serverCertificate)
 			hash.Write(remoteNonce)
 			hashed := hash.Sum(nil)
 			signature, err := rsa.SignPSS(rand.Reader, ui.Key, crypto.SHA256, hashed, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
