@@ -315,8 +315,9 @@ func TestClientDialRejectsUnsupportedServerCertificate(t *testing.T) {
 				c.Abort(ctx)
 				t.Fatal("Dial succeeded, want an error")
 			}
-			if err != ua.BadSecurityChecksFailed {
-				t.Fatalf("Dial() = %v, want %v", err, ua.BadSecurityChecksFailed)
+			// the endpoint may be rejected while it is selected, or when the channel is opened.
+			if err != ua.BadSecurityChecksFailed && err != ua.BadCertificateInvalid {
+				t.Fatalf("Dial() = %v, want %v or %v", err, ua.BadSecurityChecksFailed, ua.BadCertificateInvalid)
 			}
 		})
 	}
