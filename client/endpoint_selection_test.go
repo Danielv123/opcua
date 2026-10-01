@@ -422,6 +422,34 @@ func TestSelectEndpoint(t *testing.T) {
 			wantPolicy: aes256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "user_0",
 		},
 		{
+			// an attacker may order equal-ranked endpoints weak first and remove the certificate of the stronger one.
+			name: "equal-ranked endpoint without server certificate fails (weak first)",
+			opts: []Option{withClientCert, withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, userNameToken("user_0", b128)),
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 1, "", userNameToken("user_1", aes256)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "equal-ranked endpoint without server certificate fails (strong first)",
+			opts: []Option{withClientCert, withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 1, "", userNameToken("user_1", aes256)),
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, userNameToken("user_0", b128)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "equal-ranked endpoint without certificate for token encryption fails (weak first)",
+			opts: []Option{withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, serverCert, userNameToken("user_0", b128)),
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", userNameToken("user_1", aes256)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
 			name: "secured endpoint with weak RSA key is rejected",
 			opts: []Option{withClientCert},
 			endpoints: []ua.EndpointDescription{

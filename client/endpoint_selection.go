@@ -22,10 +22,10 @@ import (
 //
 // Endpoints are ranked by decreasing security level, then security mode, then security policy strength, so the
 // order of the discovery response does not matter. Among endpoints of equal rank, the endpoint with the strongest
-// user token policy is selected. If a candidate that ranks above the selected endpoint has a missing or unusable
-// server certificate, for the channel or for its user token policy, selection fails, rather than falling back to a
-// weaker endpoint, since the server may omit certificates from the endpoints returned by CreateSession, which are
-// later compared with the discovery response.
+// user token policy is selected. If a candidate that ranks above or equal to the selected endpoint has a missing or
+// unusable server certificate, for the channel or for its user token policy, selection fails, rather than falling
+// back to a weaker endpoint or user token policy, since the server may omit certificates from the endpoints returned
+// by CreateSession, which are later compared with the discovery response.
 //
 // Returns the selected endpoint and the user token policy to use, or an error describing why no endpoint was selected.
 func (ch *Client) selectEndpoint(endpoints []ua.EndpointDescription) (*ua.EndpointDescription, *ua.UserTokenPolicy, error) {
@@ -77,16 +77,14 @@ func (ch *Client) selectEndpoint(endpoints []ua.EndpointDescription) (*ua.Endpoi
 			continue
 		}
 		// a secured channel must be authenticated with the server certificate.
+		// An attacker may remove the certificate to force a weaker endpoint, so fail rather than skip it.
 		if e.SecurityMode != ua.MessageSecurityModeNone && !isUsableCertificate(e.ServerCertificate, e.SecurityPolicyURI) {
-			if selected == nil {
-				return nil, nil, ua.BadCertificateInvalid
-			}
-			continue
+			return nil, nil, ua.BadCertificateInvalid
 		}
 		tokenPolicy, err := ch.selectUserTokenPolicy(e)
 		if err != nil {
 			// the server certificate needed to encrypt the user token is missing or unusable.
-			if err == ua.BadCertificateInvalid && selected == nil {
+			if err == ua.BadCertificateInvalid {
 				return nil, nil, err
 			}
 			if reason == ua.BadSecurityModeRejected {
