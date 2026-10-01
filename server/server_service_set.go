@@ -11,6 +11,8 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/binary"
+	"errors"
+	"log"
 	"math"
 	"reflect"
 	"sort"
@@ -818,6 +820,13 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 
 	}
 	if err != nil {
+		// authenticators may reject the user with any error. Return the status code if one was given,
+		// otherwise log the error and deny access without disclosing the error to the client.
+		var statusCode ua.StatusCode
+		if !errors.As(err, &statusCode) || !statusCode.IsBad() {
+			log.Printf("Rejected user identity. Authenticator returned error: %s\n", err)
+			statusCode = ua.BadUserAccessDenied
+		}
 		srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
 		srv.serverDiagnosticsSummary.RejectedSessionCount++
 		srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
@@ -827,7 +836,7 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 				ResponseHeader: ua.ResponseHeader{
 					Timestamp:     time.Now(),
 					RequestHandle: req.RequestHandle,
-					ServiceResult: err.(ua.StatusCode),
+					ServiceResult: statusCode,
 				},
 			},
 			requestid,

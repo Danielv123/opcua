@@ -4,7 +4,8 @@ import "github.com/awcullen/opcua/ua"
 
 // UserNameIdentityAuthenticator authenticates AnonymousIdentity.
 type AnonymousIdentityAuthenticator interface {
-	// AuthenticateUserNameIdentity returns nil when user identity is authenticated, or BadUserAccessDenied otherwise.
+	// AuthenticateAnonymousIdentity returns nil when user identity is authenticated, or an error otherwise.
+	// See UserNameIdentityAuthenticator for how errors are reported to the client.
 	AuthenticateAnonymousIdentity(userIdentity ua.AnonymousIdentity, applicationURI string, endpointURL string) error
 }
 
@@ -18,7 +19,9 @@ func (f AuthenticateAnonymousIdentityFunc) AuthenticateAnonymousIdentity(userIde
 
 // UserNameIdentityAuthenticator authenticates UserNameIdentity.
 type UserNameIdentityAuthenticator interface {
-	// AuthenticateUserNameIdentity returns nil when user identity is authenticated, or BadUserAccessDenied otherwise.
+	// AuthenticateUserNameIdentity returns nil when user identity is authenticated, or an error otherwise,
+	// typically BadUserAccessDenied. If the error is (or wraps) a bad ua.StatusCode, that status code is
+	// returned to the client. Any other error is logged by the server and the client receives BadUserAccessDenied.
 	AuthenticateUserNameIdentity(userIdentity ua.UserNameIdentity, applicationURI string, endpointURL string) error
 }
 
@@ -32,7 +35,8 @@ func (f AuthenticateUserNameIdentityFunc) AuthenticateUserNameIdentity(userIdent
 
 // X509IdentityAuthenticator authenticates X509Identity.
 type X509IdentityAuthenticator interface {
-	// AuthenticateUser returns nil when user is authenticated, or BadUserAccessDenied otherwise.
+	// AuthenticateX509Identity returns nil when user is authenticated, or an error otherwise.
+	// See UserNameIdentityAuthenticator for how errors are reported to the client.
 	AuthenticateX509Identity(userIdentity ua.X509Identity, applicationURI string, endpointURL string) error
 }
 
@@ -46,7 +50,8 @@ func (f AuthenticateX509IdentityFunc) AuthenticateX509Identity(userIdentity ua.X
 
 // IssuedIdentityAuthenticator authenticates user identities.
 type IssuedIdentityAuthenticator interface {
-	// AuthenticateIssuedIdentity returns nil when user is authenticated, or BadUserAccessDenied otherwise.
+	// AuthenticateIssuedIdentity returns nil when user is authenticated, or an error otherwise.
+	// See UserNameIdentityAuthenticator for how errors are reported to the client.
 	AuthenticateIssuedIdentity(userIdentity ua.IssuedIdentity, applicationURI string, endpointURL string) error
 }
 
