@@ -235,6 +235,11 @@ func (ch *serverSecureChannel) Open() error {
 		if len(ch.endpointURL) > maxEndpointURLLength {
 			return ua.BadTCPEndpointURLInvalid
 		}
+		// OPC UA Part 6 requires buffers of at least 8192 bytes.
+		const minBufferSize = 8192
+		if cliReceiveBufferSize < minBufferSize || cliSendBufferSize < minBufferSize {
+			return ua.BadTCPNotEnoughResources
+		}
 		// log.Printf("-> Hello { ver: %d, rec: %d, snd: %d, msg: %d, chk: %d, ep: %s }\n", remoteProtocolVersion, remoteReceiveBufferSize, remoteSendBufferSize, remoteMaxMessageSize, remoteMaxChunkCount, ch.endpointURL)
 
 	default:

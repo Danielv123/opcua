@@ -362,6 +362,11 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		if err := dec.ReadUInt32(&ch.receiveBufferSize); err != nil {
 			return err
 		}
+		// OPC UA Part 6 requires buffers of at least 8192 bytes.
+		const minBufferSize = 8192
+		if ch.sendBufferSize < minBufferSize || ch.receiveBufferSize < minBufferSize {
+			return ua.BadTCPNotEnoughResources
+		}
 		if err := dec.ReadUInt32(&ch.maxRequestMessageSize); err != nil {
 			return err
 		}

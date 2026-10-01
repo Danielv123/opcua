@@ -46,12 +46,18 @@ func openWithHello(t *testing.T, hello []byte) error {
 // helloMessage returns a Hello message whose EndpointUrl has the given encoded
 // length followed by the given bytes.
 func helloMessage(urlLength int32, url string) []byte {
+	return helloMessageWithBuffers(defaultMaxBufferSize, defaultMaxBufferSize, urlLength, url)
+}
+
+// helloMessageWithBuffers returns a Hello message with the given buffer sizes,
+// whose EndpointUrl has the given encoded length followed by the given bytes.
+func helloMessageWithBuffers(receiveBufferSize, sendBufferSize uint32, urlLength int32, url string) []byte {
 	buf := &bytes.Buffer{}
 	binary.Write(buf, binary.LittleEndian, ua.MessageTypeHello)
 	binary.Write(buf, binary.LittleEndian, uint32(32+len(url)))
 	binary.Write(buf, binary.LittleEndian, protocolVersion)
-	binary.Write(buf, binary.LittleEndian, defaultMaxBufferSize)
-	binary.Write(buf, binary.LittleEndian, defaultMaxBufferSize)
+	binary.Write(buf, binary.LittleEndian, receiveBufferSize)
+	binary.Write(buf, binary.LittleEndian, sendBufferSize)
 	binary.Write(buf, binary.LittleEndian, defaultMaxMessageSize)
 	binary.Write(buf, binary.LittleEndian, defaultMaxChunkCount)
 	binary.Write(buf, binary.LittleEndian, urlLength)
@@ -64,6 +70,20 @@ func TestHelloEndpointURLTooLong(t *testing.T) {
 	err := openWithHello(t, helloMessage(int32(len(url)), url))
 	if err != ua.BadTCPEndpointURLInvalid {
 		t.Fatalf("expected BadTCPEndpointURLInvalid, got %v", err)
+	}
+}
+
+func TestHelloBufferSizeTooSmall(t *testing.T) {
+	url := "opc.tcp://localhost:4840"
+	for _, size := range []uint32{0, 1, 8191} {
+		err := openWithHello(t, helloMessageWithBuffers(size, defaultMaxBufferSize, int32(len(url)), url))
+		if err != ua.BadTCPNotEnoughResources {
+			t.Fatalf("receive buffer size %d: expected BadTCPNotEnoughResources, got %v", size, err)
+		}
+		err = openWithHello(t, helloMessageWithBuffers(defaultMaxBufferSize, size, int32(len(url)), url))
+		if err != ua.BadTCPNotEnoughResources {
+			t.Fatalf("send buffer size %d: expected BadTCPNotEnoughResources, got %v", size, err)
+		}
 	}
 }
 

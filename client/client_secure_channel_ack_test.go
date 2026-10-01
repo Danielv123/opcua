@@ -69,6 +69,30 @@ func errorMessage(code ua.StatusCode, reasonLength int32, reason string) []byte 
 	return buf.Bytes()
 }
 
+// ackMessage returns an Acknowledge message with the given buffer sizes.
+func ackMessage(receiveBufferSize, sendBufferSize uint32) []byte {
+	buf := &bytes.Buffer{}
+	binary.Write(buf, binary.LittleEndian, ua.MessageTypeAck)
+	binary.Write(buf, binary.LittleEndian, uint32(28))
+	binary.Write(buf, binary.LittleEndian, protocolVersion)
+	binary.Write(buf, binary.LittleEndian, receiveBufferSize)
+	binary.Write(buf, binary.LittleEndian, sendBufferSize)
+	binary.Write(buf, binary.LittleEndian, defaultMaxMessageSize)
+	binary.Write(buf, binary.LittleEndian, defaultMaxChunkCount)
+	return buf.Bytes()
+}
+
+func TestOpenReceivesAckWithBufferSizeTooSmall(t *testing.T) {
+	for _, size := range []uint32{0, 1, 8191} {
+		if err := openWithReply(t, ackMessage(size, defaultMaxBufferSize)); err != ua.BadTCPNotEnoughResources {
+			t.Fatalf("receive buffer size %d: expected BadTCPNotEnoughResources, got %v", size, err)
+		}
+		if err := openWithReply(t, ackMessage(defaultMaxBufferSize, size)); err != ua.BadTCPNotEnoughResources {
+			t.Fatalf("send buffer size %d: expected BadTCPNotEnoughResources, got %v", size, err)
+		}
+	}
+}
+
 func TestOpenReceivesError(t *testing.T) {
 	reason := "endpoint not found"
 	err := openWithReply(t, errorMessage(ua.BadTCPEndpointURLInvalid, int32(len(reason)), reason))
