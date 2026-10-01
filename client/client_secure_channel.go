@@ -487,7 +487,9 @@ func (ch *clientSecureChannel) Close(ctx context.Context) error {
 	defer ch.Unlock()
 	ch.closing = true
 	_, err := ch.Request(ctx, &ua.CloseSecureChannelRequest{})
-	if err != nil {
+	// the server closes the connection when it receives the request, which may be noticed before
+	// the response to the request is.
+	if err != nil && err != ua.BadSecureChannelClosed {
 		return err
 	}
 	if ch.conn != nil {
