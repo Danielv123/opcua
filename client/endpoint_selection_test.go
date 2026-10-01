@@ -109,6 +109,10 @@ func TestSelectEndpoint(t *testing.T) {
 	serverCert := newTestRSACertificate(t)
 	ecdsaCert := newTestECDSACertificate(t)
 	weakCert := newTestRSACertificateWithKeySize(t, 1024)
+	weakKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
 	clientCert := []byte(newTestRSACertificate(t))
 	withClientCert := WithClientCertificate(clientCert, nil)
 	withUserName := WithUserNameIdentity("user", "password")
@@ -440,6 +444,52 @@ func TestSelectEndpoint(t *testing.T) {
 				testEndpoint(none, ua.MessageSecurityModeNone, 0, weakCert, userNameToken("user_0", aes256)),
 			},
 			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			// an attacker may remove the certificate needed to encrypt the token, to force a weaker endpoint.
+			name: "token certificate failure on higher-ranked endpoint fails rather than falling back",
+			opts: []Option{withClientCert, withUserName, WithMinSecurityMode(ua.MessageSecurityModeNone)},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 10, "", userNameToken("user_0", aes256)),
+				testEndpoint(b128, ua.MessageSecurityModeSign, 1, serverCert, userNameToken("user_1", b128)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "plaintext token is not used when certificate for encrypted token is missing",
+			opts: []Option{withUserName, WithInsecurePlaintextCredentials()},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, "", userNameToken("user_0", b256), userNameToken("user_1", none)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "weaker token policy is not used when certificate is too small for stronger token policy",
+			opts: []Option{withUserName},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(none, ua.MessageSecurityModeNone, 0, weakCert, userNameToken("user_0", aes256), userNameToken("user_1", b128)),
+			},
+			wantErr: ua.BadCertificateInvalid,
+		},
+		{
+			name: "x509 identity key must be large enough for token policy",
+			opts: []Option{withClientCert, WithX509Identity(clientCert, weakKey)},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 5, serverCert, x509Token("x509_0", aes256), x509Token("x509_1", b128)),
+			},
+			wantPolicy: b256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "x509_1",
+		},
+		{
+			name: "issued token policies of other token types are not considered",
+			opts: []Option{withClientCert, WithIssuedIdentity([]byte("token"))},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 5, serverCert,
+					ua.UserTokenPolicy{PolicyID: "jwt_0", TokenType: ua.UserTokenTypeIssuedToken, IssuedTokenType: "urn:jwt", SecurityPolicyURI: b128},
+					ua.UserTokenPolicy{PolicyID: "saml_0", TokenType: ua.UserTokenTypeIssuedToken, IssuedTokenType: "urn:saml", SecurityPolicyURI: aes256},
+					ua.UserTokenPolicy{PolicyID: "jwt_1", TokenType: ua.UserTokenTypeIssuedToken, IssuedTokenType: "urn:jwt", SecurityPolicyURI: b256},
+				),
+			},
+			wantPolicy: b256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "jwt_1",
 		},
 		{
 			name: "selects strongest token policy",
