@@ -326,12 +326,12 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 	//   log.Printf("Hello{\"Version\":%d,\"ReceiveBufferSize\":%d,\"SendBufferSize\":%d,\"MaxMessageSize\":%d,\"MaxChunkCount\":%d,\"EndpointURL\":\"%s\"}\n", protocolVersion, ch.receiveBufferSize, ch.sendBufferSize, ch.maxResponseMessageSize, ch.maxResponseChunkCount, ch.endpointURL)
 	// }
 
-	_, err = ch.Read(buf)
+	n, err := ch.Read(buf)
 	if err != nil {
 		return err
 	}
 
-	var reader = bytes.NewReader(buf)
+	var reader = bytes.NewReader(buf[:n])
 	var dec = ua.NewBinaryDecoder(reader, ch)
 	var msgType uint32
 	if err := dec.ReadUInt32(&msgType); err != nil {

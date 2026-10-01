@@ -273,6 +273,62 @@ func TestDecodeArrayLengthExceedsInput(t *testing.T) {
 	}
 }
 
+func TestDecodeEmptyStructArrays(t *testing.T) {
+	// elements of empty structures have no encoding.
+	want := []ua.Vector{{}, {}, {}}
+	buf := &bytes.Buffer{}
+	if err := ua.NewBinaryEncoder(buf, ua.NewEncodingContext()).Encode(want); err != nil {
+		t.Fatal(err)
+	}
+	assert.DeepEqual(t, buf.Bytes(), le32(3))
+	for _, input := range [][]byte{le32(3), le32(0x7FFFFFFF)} {
+		for kind, r := range readerKinds(input) {
+			dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
+			var got []ua.Vector
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			if err := dec.Decode(&got); err != nil {
+				t.Fatalf("%s: %v", kind, err)
+			}
+			runtime.ReadMemStats(&after)
+			if len(got) != int(binary.LittleEndian.Uint32(input)) {
+				t.Fatalf("%s: decoded %d elements", kind, len(got))
+			}
+			if n := after.TotalAlloc - before.TotalAlloc; n > maxTestAlloc {
+				t.Fatalf("%s: decoder allocated %d bytes", kind, n)
+			}
+		}
+	}
+	// arrays of types that are not encoded but take memory are not supported.
+	var ptrs []*ua.Vector
+	dec := ua.NewBinaryDecoder(bytes.NewReader(le32(0x7FFFFFFF)), ua.NewEncodingContext())
+	if err := dec.Decode(&ptrs); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestDecodeArrayPreallocationIsProportional(t *testing.T) {
+	// an array of 200,000 DataValues, each of which may be encoded in one byte,
+	// whose first element is invalid.
+	const n = 200_000
+	input := cat([]byte{0x97}, le32(n), []byte{0x01, 0x3F}, make([]byte, n))
+	for kind, r := range readerKinds(input) {
+		dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		var v ua.Variant
+		if err := dec.ReadVariant(&v); err == nil {
+			t.Fatalf("%s: expected an error", kind)
+		}
+		runtime.ReadMemStats(&after)
+		// a DataValue takes about 88 bytes.
+		if a := after.TotalAlloc - before.TotalAlloc; a > 4*uint64(len(input))+64*1024 {
+			t.Fatalf("%s: decoder allocated %d bytes for a %d byte input", kind, a, len(input))
+		}
+	}
+}
+
 func TestDecodeNullAndEmptyArrays(t *testing.T) {
 	for kind, r := range readerKinds(cat(le32(-1), le32(0))) {
 		dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
@@ -361,8 +417,12 @@ func TestDecodeVariantArrayDimensions(t *testing.T) {
 		// 2 values, dimensions overflow int32 and int64 when multiplied
 		"overflowing dimensions": cat([]byte{0xC6}, le32(2), le32(1), le32(2), le32(3), le32(0x7FFFFFFF), le32(0x7FFFFFFF), le32(0x7FFFFFFF)),
 		// 0 values, but dimensions that ask for billions of empty rows
-		"huge empty 2D array": cat([]byte{0xC1}, le32(0), le32(2), le32(0x7FFFFFFF), le32(0)),
-		"huge empty 3D array": cat([]byte{0xC1}, le32(0), le32(3), le32(0x10000), le32(0x10000), le32(0)),
+		"huge empty 2D array":  cat([]byte{0xC1}, le32(0), le32(2), le32(0x7FFFFFFF), le32(0)),
+		"huge empty 3D array":  cat([]byte{0xC1}, le32(0), le32(3), le32(0x10000), le32(0x10000), le32(0)),
+		"too many empty rows":  cat([]byte{0xC1}, le32(0), le32(2), le32(17), le32(0)),
+		"too many empty cells": cat([]byte{0xC1}, le32(0), le32(3), le32(4), le32(5), le32(0)),
+		// many empty matrices, each with many rows
+		"many empty matrices": cat([]byte{0x98}, le32(683), bytes.Repeat(cat([]byte{0xC1}, le32(0), le32(2), le32(0x10000), le32(0)), 683)),
 		// one dimension
 		"rank 1": cat([]byte{0xC6}, le32(2), le32(1), le32(2), le32(1), le32(2)),
 		// missing dimensions
@@ -387,6 +447,8 @@ func TestDecodeVariantMatrixRoundTrip(t *testing.T) {
 		[][]bool{{}, {}, {}},
 		[][][]float64{{{1, 2}, {3, 4}}, {{5, 6}, {7, 8}}, {{9, 10}, {11, 12}}},
 		[][][]byte{{{}, {}}},
+		[][]bool{{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}},
+		[][][]int16{{{}, {}, {}, {}}, {{}, {}, {}, {}}, {{}, {}, {}, {}}, {{}, {}, {}, {}}},
 		[][]ua.Variant{{int32(1), "x"}, {nil, true}},
 	}
 	for _, in := range cases {
@@ -406,24 +468,56 @@ func TestDecodeVariantMatrixRoundTrip(t *testing.T) {
 	}
 }
 
+// requestHeaderBody returns the encoding of a RequestHeader.
+func requestHeaderBody(t *testing.T, h ua.RequestHeader) []byte {
+	buf := &bytes.Buffer{}
+	if err := ua.NewBinaryEncoder(buf, ua.NewEncodingContext()).Encode(&h); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
 func TestDecodeExtensionObjectBodyLengthExceedsInput(t *testing.T) {
 	// RequestHeader binary encoding id (i=391), binary body, declared body length.
 	prefix := []byte{0x01, 0x00, 0x87, 0x01, 0x01}
+	body := requestHeaderBody(t, ua.RequestHeader{AuditEntryID: "audit"})
 	cases := map[string][]byte{
 		"known type":   cat(prefix, le32(0x7FFFFFFF), make([]byte, 40)),
 		"unknown type": cat([]byte{0x01, 0x00, 0xff, 0xff, 0x01}, le32(0x7FFFFFFF), make([]byte, 40)),
 		"xml body":     cat([]byte{0x00, 0x00, 0x02}, le32(0x7FFFFFFF), make([]byte, 40)),
 		"negative":     cat(prefix, le32(-2), make([]byte, 40)),
+		// the body is decoded within its declared length.
+		"empty body":     cat(prefix, le32(0), body),
+		"null body":      cat(prefix, le32(-1), body),
+		"short body":     cat(prefix, le32(int32(len(body)-1)), body),
+		"string in body": cat(prefix, le32(30), body),
 	}
 	for name, input := range cases {
 		t.Run(name, func(t *testing.T) {
-			// the body of a known type is decoded by its type, so its declared length
-			// can only be checked if the length of the input is known.
-			expectDecodeBounded(t, input, func(dec *ua.BinaryDecoder) error {
+			expectRejected(t, input, func(dec *ua.BinaryDecoder) error {
 				var v ua.ExtensionObject
 				return dec.ReadExtensionObject(&v)
-			}, name != "known type")
+			})
 		})
+	}
+}
+
+func TestDecodeExtensionObjectBody(t *testing.T) {
+	prefix := []byte{0x01, 0x00, 0x87, 0x01, 0x01}
+	want := ua.RequestHeader{Timestamp: time.Date(2021, time.January, 1, 12, 0, 0, 0, time.UTC), RequestHandle: 7, AuditEntryID: "audit", TimeoutHint: 1000}
+	body := requestHeaderBody(t, want)
+	// a body that is longer than the type's encoding, e.g. one of a later version of the
+	// type, is skipped to its end.
+	input := cat(prefix, le32(int32(len(body)+3)), body, []byte{1, 2, 3}, prefix, le32(int32(len(body))), body)
+	for kind, r := range readerKinds(input) {
+		dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
+		for i := 0; i < 2; i++ {
+			var v ua.ExtensionObject
+			if err := dec.ReadExtensionObject(&v); err != nil {
+				t.Fatalf("%s: %v", kind, err)
+			}
+			assert.DeepEqual(t, v, ua.ExtensionObject(want))
+		}
 	}
 }
 
@@ -455,13 +549,48 @@ func TestDecodeNestingLimit(t *testing.T) {
 		})
 	}
 
-	// a DataValue reports a Variant it cannot decode as BadDataTypeIDUnknown, but
-	// not one that is nested too deeply.
+	// a DataValue does not report a Variant nested too deeply as a status code.
 	input := cat(bytes.Repeat([]byte{0x01, 0x17}, depth), []byte{0x00})
 	dec := ua.NewBinaryDecoder(bytes.NewReader(input), ua.NewEncodingContext())
 	var dv ua.DataValue
-	if err := dec.ReadDataValue(&dv); !errors.Is(err, ua.BadEncodingLimitsExceeded) {
-		t.Fatalf("expected BadEncodingLimitsExceeded, got %v", err)
+	if err := dec.ReadDataValue(&dv); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestDecodeDataValueWithUnsupportedVariant(t *testing.T) {
+	// a DataValue reports a Variant that it read, but cannot represent, as BadDataTypeIDUnknown.
+	rank4 := cat([]byte{0xC6}, le32(1), le32(7), le32(4), le32(1), le32(1), le32(1), le32(1))
+	timestamp := make([]byte, 8)
+	input := cat([]byte{0x05}, rank4, timestamp, []byte{0x01, 0x06}, le32(8))
+	for kind, r := range readerKinds(input) {
+		dec := ua.NewBinaryDecoder(r, ua.NewEncodingContext())
+		var dv ua.DataValue
+		if err := dec.ReadDataValue(&dv); err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		assert.Equal(t, dv.StatusCode, ua.BadDataTypeIDUnknown)
+		// the input that follows is decoded.
+		if err := dec.ReadDataValue(&dv); err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		assert.DeepEqual(t, dv.Value, ua.Variant(int32(8)))
+	}
+
+	// any other error is returned, as the input that follows cannot be found.
+	cases := map[string][]byte{
+		"unknown variant type": cat([]byte{0x01, 0x1F}, le32(8)),
+		"string too long":      cat([]byte{0x01, 0x0C}, le32(100), []byte("abc")),
+		"array too long":       cat([]byte{0x01, 0x98}, le32(100), []byte{0x00}),
+		"bad array element":    cat([]byte{0x01, 0x98}, le32(100), []byte{0x3F}, make([]byte, 100)),
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			expectRejected(t, cat([]byte{0x97}, le32(1000), bytes.Repeat(input, 1000)), func(dec *ua.BinaryDecoder) error {
+				var v ua.Variant
+				return dec.ReadVariant(&v)
+			})
+		})
 	}
 }
 
@@ -510,22 +639,17 @@ func TestDecodeGrowingInput(t *testing.T) {
 	long := strings.Repeat("x", 100*1024)
 	partition := buffer.NewPartitionAt(buffer.NewMemPoolAt(1024))
 	enc := ua.NewBinaryEncoder(partition, ua.NewEncodingContext())
-	if err := enc.WriteString(long); err != nil {
-		t.Fatal(err)
-	}
 	dec := ua.NewBinaryDecoder(partition, ua.NewEncodingContext())
 	var s string
-	if err := dec.ReadString(&s); err != nil {
-		t.Fatal(err)
+	for _, want := range []string{"a", "b", long, "abc"} {
+		if err := enc.WriteString(want); err != nil {
+			t.Fatal(err)
+		}
+		if err := dec.ReadString(&s); err != nil {
+			t.Fatal(err)
+		}
+		assert.Equal(t, s, want)
 	}
-	assert.Equal(t, s, long)
-	if err := enc.WriteString("abc"); err != nil {
-		t.Fatal(err)
-	}
-	if err := dec.ReadString(&s); err != nil {
-		t.Fatal(err)
-	}
-	assert.Equal(t, s, "abc")
 
 	// an input that reports its length as int is not sampled.
 	buf := &bytes.Buffer{}

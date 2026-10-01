@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 	"unsafe"
@@ -27,19 +28,23 @@ const (
 	maxNestingDepth = 100
 
 	// maxPreallocBytes limits the memory allocated for a String, ByteString or array
-	// before its contents have been read, when its length cannot be checked against
-	// the remaining input, or when its decoded elements are larger than their encoding.
-	// Beyond this, memory is allocated as the contents are decoded, so that the memory
-	// used stays proportional to the size of the input.
+	// before its contents have been read, when the number of unread bytes of the
+	// input is unknown. Beyond this, memory is allocated as the contents are decoded,
+	// so that the memory used stays proportional to the size of the input.
 	maxPreallocBytes = 64 * 1024
 
-	// maxEmptyArraySlices limits the number of slices allocated for a
-	// multi-dimensional array with no elements, e.g. one of ArrayDimensions [n, 0].
-	maxEmptyArraySlices = 64 * 1024
+	// maxPreallocRatio limits the memory allocated for an array before its elements
+	// have been decoded to this many bytes per unread byte of the input, if that is
+	// more than maxPreallocBytes. Decoded elements may be much larger than their
+	// encoding (a DataValue may be encoded in one byte), so this bounds the memory
+	// allocated for an array that then fails to decode. Beyond this, memory is
+	// allocated as elements are decoded.
+	maxPreallocRatio = 4
 
-	// resampleInterval is the number of bytes that must be read before the decoder
-	// samples the length of an input that reports it with a Len() int64 method again.
-	resampleInterval = 64 * 1024
+	// maxEmptyArraySlices limits the number of slices at each level of a
+	// multi-dimensional array with no elements, e.g. one of ArrayDimensions [n, 0],
+	// so that the memory such an array uses stays proportional to its encoding.
+	maxEmptyArraySlices = 16
 )
 
 // intLener is implemented by inputs that report the number of unread bytes, such as
@@ -72,13 +77,13 @@ type BinaryDecoder struct {
 	sampledLen int64
 	// sampledAt is the value of read when sampledLen was sampled, or -1.
 	sampledAt int64
+	// limit is the value of read at the end of the ExtensionObject body being
+	// decoded, or math.MaxInt64.
+	limit int64
 
 	// depth is the current nesting depth of Variants, DataValues, ExtensionObjects
 	// and DiagnosticInfos.
 	depth int
-	// nestingLimitExceeded reports whether the nesting depth limit was exceeded
-	// while decoding the current outermost value.
-	nestingLimitExceeded bool
 }
 
 // NewBinaryDecoder returns a new decoder that reads from an io.Reader.
@@ -89,7 +94,7 @@ type BinaryDecoder struct {
 // before memory is allocated for them. Otherwise, memory for long Strings,
 // ByteStrings and arrays is allocated as their contents are read.
 func NewBinaryDecoder(r io.Reader, ec EncodingContext) *BinaryDecoder {
-	dec := &BinaryDecoder{r: r, ec: ec, sampledAt: -1}
+	dec := &BinaryDecoder{r: r, ec: ec, sampledAt: -1, limit: math.MaxInt64}
 	switch l := r.(type) {
 	case intLener:
 		dec.lenr = l
@@ -101,8 +106,27 @@ func NewBinaryDecoder(r io.Reader, ec EncodingContext) *BinaryDecoder {
 
 // readFull reads exactly len(p) bytes.
 func (dec *BinaryDecoder) readFull(p []byte) error {
+	if int64(len(p)) > dec.limit-dec.read {
+		return BadDecodingError
+	}
 	n, err := io.ReadFull(dec.r, p)
 	dec.read += int64(n)
+	if err != nil {
+		return BadDecodingError
+	}
+	return nil
+}
+
+// skip reads and discards n bytes.
+func (dec *BinaryDecoder) skip(n int64) error {
+	if n <= 0 {
+		return nil
+	}
+	if n > dec.limit-dec.read {
+		return BadDecodingError
+	}
+	m, err := io.CopyN(io.Discard, dec.r, n)
+	dec.read += m
 	if err != nil {
 		return BadDecodingError
 	}
@@ -133,24 +157,27 @@ func (dec *BinaryDecoder) sampleLen() {
 }
 
 // checkAvailable returns BadDecodingError if fewer than n bytes of the input remain
-// unread. It reports whether the number of unread bytes is known.
-func (dec *BinaryDecoder) checkAvailable(n int64) (bool, error) {
+// unread, or if n bytes would extend beyond the ExtensionObject body being decoded.
+// Otherwise it returns the number of unread bytes that may be decoded, or -1 if
+// the number of unread bytes of the input is unknown.
+func (dec *BinaryDecoder) checkAvailable(n int64) (int64, error) {
+	if n > dec.limit-dec.read {
+		return 0, BadDecodingError
+	}
 	rem := dec.remaining()
 	if rem < 0 {
-		return false, nil
+		return -1, nil
 	}
-	if n <= rem {
-		return true, nil
-	}
-	// the input may have grown since its length was sampled, so sample it again,
-	// but not too often, since this may be costly.
-	if dec.len64r != nil && dec.read-dec.sampledAt >= resampleInterval {
+	if n > rem && dec.len64r != nil {
+		// the input may have grown since its length was sampled, so sample it again.
+		// As a failed check ends decoding, this is not repeated for one message.
 		dec.sampleLen()
-		if n <= dec.sampledLen {
-			return true, nil
-		}
+		rem = dec.sampledLen
 	}
-	return true, BadDecodingError
+	if n > rem {
+		return 0, BadDecodingError
+	}
+	return min(rem, dec.limit-dec.read), nil
 }
 
 // readLength reads the Int32 length of a String, ByteString or array. It returns -1
@@ -168,11 +195,11 @@ func (dec *BinaryDecoder) readLength() (int, error) {
 
 // readBytes reads n bytes, where n is a length read from the input.
 func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
-	known, err := dec.checkAvailable(int64(n))
+	rem, err := dec.checkAvailable(int64(n))
 	if err != nil {
 		return nil, err
 	}
-	if known || n <= maxPreallocBytes {
+	if rem >= 0 || n <= maxPreallocBytes {
 		bs := make([]byte, n)
 		if err := dec.readFull(bs); err != nil {
 			return nil, err
@@ -183,7 +210,8 @@ func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
 	bs := make([]byte, 0, maxPreallocBytes)
 	for len(bs) < n {
 		if len(bs) == cap(bs) {
-			bs = append(bs, 0)[:len(bs)]
+			// at most double the slice, so that it stays proportional to the bytes read.
+			bs = slices.Grow(bs, min(len(bs), n-len(bs)))
 		}
 		m := min(cap(bs), n)
 		if err := dec.readFull(bs[len(bs):m]); err != nil {
@@ -195,14 +223,17 @@ func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
 }
 
 // preallocLen returns the capacity to allocate for an array of n elements of
-// elemSize bytes, each encoded in at least minSize bytes, where known reports whether
-// the encoded size of the array has been checked against the remaining input.
-func preallocLen(n int, known bool, elemSize uintptr, minSize int64) int {
-	if elemSize == 0 || (known && int64(elemSize) <= minSize) {
-		// the array is no larger than its encoding.
+// elemSize bytes before they are decoded, where rem is the number of unread bytes
+// of the input, or -1 if unknown.
+func preallocLen(n int, elemSize uintptr, rem int64) int {
+	if elemSize == 0 {
 		return n
 	}
-	return min(n, max(1, maxPreallocBytes/int(elemSize)))
+	limit := int64(maxPreallocBytes)
+	if rem >= 0 {
+		limit = max(limit, min(rem, math.MaxInt64/maxPreallocRatio)*maxPreallocRatio)
+	}
+	return int(min(int64(n), max(1, limit/int64(elemSize))))
 }
 
 // readArray reads an array of elements that are each encoded in at least minSize bytes.
@@ -214,12 +245,12 @@ func readArray[T any](dec *BinaryDecoder, minSize int64, read func(*BinaryDecode
 	if n < 0 {
 		return nil, nil
 	}
-	known, err := dec.checkAvailable(int64(n) * minSize)
+	rem, err := dec.checkAvailable(int64(n) * minSize)
 	if err != nil {
 		return nil, err
 	}
 	var zero T
-	values := make([]T, 0, preallocLen(n, known, unsafe.Sizeof(zero), minSize))
+	values := make([]T, 0, preallocLen(n, unsafe.Sizeof(zero), rem))
 	for i := 0; i < n; i++ {
 		values = append(values, zero)
 		if err := read(dec, &values[i]); err != nil {
@@ -233,7 +264,6 @@ func readArray[T any](dec *BinaryDecoder, minSize int64, read func(*BinaryDecode
 // values. It returns BadEncodingLimitsExceeded if the depth would exceed the limit.
 func (dec *BinaryDecoder) enter() error {
 	if dec.depth >= maxNestingDepth {
-		dec.nestingLimitExceeded = true
 		return BadEncodingLimitsExceeded
 	}
 	dec.depth++
@@ -243,9 +273,6 @@ func (dec *BinaryDecoder) enter() error {
 // leave decrements the nesting depth after decoding a value that may contain other values.
 func (dec *BinaryDecoder) leave() {
 	dec.depth--
-	if dec.depth == 0 {
-		dec.nestingLimitExceeded = false
-	}
 }
 
 // minEncodedSize returns the minimum number of bytes in the encoding of a value of the type.
@@ -445,9 +472,11 @@ func getSliceDecoder(typ reflect.Type) (decoderFunc, error) {
 	if err != nil {
 		return nil, err
 	}
-	// count elements as at least one byte, so that an array of empty structures
-	// cannot make the decoder spin.
-	minSize := max(1, minEncodedSize(elem))
+	minSize := minEncodedSize(elem)
+	if minSize == 0 && elemSize != 0 {
+		// decoding the elements would neither read input nor be free.
+		return nil, fmt.Errorf("unsupported type: %s", typ)
+	}
 	return func(buf *BinaryDecoder, p unsafe.Pointer) error {
 		n, err := buf.readLength()
 		if err != nil {
@@ -457,11 +486,16 @@ func getSliceDecoder(typ reflect.Type) (decoderFunc, error) {
 			reflect.NewAt(typ, p).Elem().Set(reflect.MakeSlice(typ, 0, 0))
 			return nil
 		}
-		known, err := buf.checkAvailable(int64(n) * minSize)
+		if minSize == 0 {
+			// elements such as empty structures have no encoding, nor any content.
+			reflect.NewAt(typ, p).Elem().Set(reflect.MakeSlice(typ, n, n))
+			return nil
+		}
+		rem, err := buf.checkAvailable(int64(n) * minSize)
 		if err != nil {
 			return err
 		}
-		c := preallocLen(n, known, elemSize, minSize)
+		c := preallocLen(n, elemSize, rem)
 		s := reflect.MakeSlice(typ, c, c)
 		for i := 0; i < n; i++ {
 			if i == c {
@@ -1027,7 +1061,12 @@ func (dec *BinaryDecoder) ReadExtensionObject(value *ExtensionObject) error {
 	if err := dec.enter(); err != nil {
 		return err
 	}
-	defer dec.leave()
+	err := dec.readExtensionObject(value)
+	dec.leave()
+	return err
+}
+
+func (dec *BinaryDecoder) readExtensionObject(value *ExtensionObject) error {
 	var nodeID NodeID
 	if err := dec.ReadNodeID(&nodeID); err != nil {
 		return BadDecodingError
@@ -1048,11 +1087,24 @@ func (dec *BinaryDecoder) ReadExtensionObject(value *ExtensionObject) error {
 			if err != nil {
 				return BadDecodingError
 			}
+			if length < 0 {
+				length = 0
+			}
 			if _, err := dec.checkAvailable(int64(length)); err != nil {
 				return BadDecodingError
 			}
+			// decode the body within its length.
+			outer := dec.limit
+			end := dec.read + int64(length)
+			dec.limit = end
 			obj := reflect.New(typ).Elem().Interface() // TODO: decide if ptr or struct
-			if err := dec.Decode(obj); err != nil {
+			err = dec.Decode(obj)
+			dec.limit = outer
+			if err != nil {
+				return BadDecodingError
+			}
+			// skip the rest of the body, such as fields of a later version of the type.
+			if err := dec.skip(end - dec.read); err != nil {
 				return BadDecodingError
 			}
 			*value = obj
@@ -1078,6 +1130,15 @@ func (dec *BinaryDecoder) ReadExtensionObject(value *ExtensionObject) error {
 
 // ReadDataValue reads a DataValue.
 func (dec *BinaryDecoder) ReadDataValue(value *DataValue) error {
+	if err := dec.enter(); err != nil {
+		return err
+	}
+	err := dec.readDataValue(value)
+	dec.leave()
+	return err
+}
+
+func (dec *BinaryDecoder) readDataValue(value *DataValue) error {
 	var (
 		v                 Variant
 		statusCode        StatusCode
@@ -1087,20 +1148,16 @@ func (dec *BinaryDecoder) ReadDataValue(value *DataValue) error {
 		serverPicoseconds uint16
 		err               error
 	)
-	if err := dec.enter(); err != nil {
-		return err
-	}
-	defer dec.leave()
 	var b byte
 	if err := dec.ReadByte(&b); err != nil {
 		return BadDecodingError
 	}
 	if (b & 1) != 0 {
 		if err := dec.ReadVariant(&v); err != nil {
-			if dec.nestingLimitExceeded {
-				return BadEncodingLimitsExceeded
+			// a Variant that was read, but whose value cannot be represented.
+			if err != BadDataTypeIDUnknown {
+				return err
 			}
-			// return BadDecodingError
 			statusCode = BadDataTypeIDUnknown
 		}
 	}
@@ -1138,7 +1195,12 @@ func (dec *BinaryDecoder) ReadVariant(value *Variant) error {
 	if err := dec.enter(); err != nil {
 		return err
 	}
-	defer dec.leave()
+	err := dec.readVariant(value)
+	dec.leave()
+	return err
+}
+
+func (dec *BinaryDecoder) readVariant(value *Variant) error {
 	var b byte
 	if err := dec.ReadByte(&b); err != nil {
 		return BadDecodingError
@@ -1629,7 +1691,9 @@ func (dec *BinaryDecoder) ReadVariant(value *Variant) error {
 }
 
 // readMatrix reads the values and ArrayDimensions of a multi-dimensional array of
-// two or three dimensions, and stores the array in value as nested slices.
+// two or three dimensions, and stores the array in value as nested slices. Once
+// both have been read, it returns BadDataTypeIDUnknown if they do not describe
+// such an array.
 func readMatrix[T any](dec *BinaryDecoder, value *Variant, readValues func(*BinaryDecoder, *[]T) error) error {
 	var vals []T
 	if err := readValues(dec, &vals); err != nil {
@@ -1653,8 +1717,9 @@ func readMatrix[T any](dec *BinaryDecoder, value *Variant, readValues func(*Bina
 	}
 	d1, d2 := int(dims[1]), int(dims[2])
 	res := make([][][]T, dims[0])
+	rows := make([][]T, len(res)*d1)
 	for i := range res {
-		res[i] = make([][]T, d1)
+		res[i], rows = rows[:d1:d1], rows[d1:]
 		for j := range res[i] {
 			res[i][j], vals = vals[:d2:d2], vals[d2:]
 		}
@@ -1663,11 +1728,12 @@ func readMatrix[T any](dec *BinaryDecoder, value *Variant, readValues func(*Bina
 	return nil
 }
 
-// checkArrayDimensions returns BadDecodingError unless dims are the ArrayDimensions
-// of a multi-dimensional array of two or three dimensions with n elements.
+// checkArrayDimensions returns BadDataTypeIDUnknown unless dims are the
+// ArrayDimensions of a multi-dimensional array of two or three dimensions with n
+// elements.
 func checkArrayDimensions(dims []int32, n int) error {
 	if len(dims) != 2 && len(dims) != 3 {
-		return BadDecodingError
+		return BadDataTypeIDUnknown
 	}
 	// limit the number of slices that hold the elements. If the array has elements,
 	// there are no more slices at any level than elements. If it has none, as when a
@@ -1676,16 +1742,16 @@ func checkArrayDimensions(dims []int32, n int) error {
 	count := int64(1)
 	for _, d := range dims {
 		if d < 0 {
-			return BadDecodingError
+			return BadDataTypeIDUnknown
 		}
 		// count <= limit <= math.MaxInt32, so this cannot overflow.
 		count *= int64(d)
 		if count > limit {
-			return BadDecodingError
+			return BadDataTypeIDUnknown
 		}
 	}
 	if count != int64(n) {
-		return BadDecodingError
+		return BadDataTypeIDUnknown
 	}
 	return nil
 }
@@ -1725,7 +1791,12 @@ func (dec *BinaryDecoder) ReadDiagnosticInfo(value *DiagnosticInfo) error {
 	if err := dec.enter(); err != nil {
 		return err
 	}
-	defer dec.leave()
+	err := dec.readDiagnosticInfo(value)
+	dec.leave()
+	return err
+}
+
+func (dec *BinaryDecoder) readDiagnosticInfo(value *DiagnosticInfo) error {
 	result := DiagnosticInfo{}
 	var b byte
 	if err := dec.ReadByte(&b); err != nil {
