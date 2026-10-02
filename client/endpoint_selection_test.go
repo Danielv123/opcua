@@ -10,6 +10,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -798,19 +799,22 @@ func TestVerifyServerEndpoints(t *testing.T) {
 			if tt.modify != nil {
 				session = tt.modify(session)
 			}
-			err := verifyServerEndpoints(discovery, session)
-			if tt.wantErr && err != ua.BadSecurityChecksFailed {
-				t.Errorf("verifyServerEndpoints() error = %v, want %v", err, ua.BadSecurityChecksFailed)
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("verifyServerEndpoints() error = %v, want nil", err)
+			for _, bind := range []bool{false, true} {
+				err := verifyServerEndpoints(discovery, session, bind)
+				if tt.wantErr && err != ua.BadSecurityChecksFailed {
+					t.Errorf("verifyServerEndpoints(%t) error = %v, want %v", bind, err, ua.BadSecurityChecksFailed)
+				}
+				if !tt.wantErr && err != nil {
+					t.Errorf("verifyServerEndpoints(%t) error = %v, want nil", bind, err)
+				}
 			}
 		})
 	}
 }
 
-// TestVerifyServerEndpointsIssuedTokenOrder verifies that the issued token type selected by the client, which is
-// the type of the first IssuedToken policy, cannot be changed by reordering the discovered token policies.
+// TestVerifyServerEndpointsIssuedTokenOrder verifies that the issued token type selected by a client with an
+// IssuedIdentity, which is the type of the first IssuedToken policy, cannot be changed by reordering the discovered
+// token policies, and that the order does not matter for other clients.
 func TestVerifyServerEndpointsIssuedTokenOrder(t *testing.T) {
 	cert := newTestRSACertificate(t)
 	jwt128 := ua.UserTokenPolicy{PolicyID: "jwt_0", TokenType: ua.UserTokenTypeIssuedToken, IssuedTokenType: "urn:jwt", SecurityPolicyURI: ua.SecurityPolicyURIBasic128Rsa15}
@@ -824,15 +828,17 @@ func TestVerifyServerEndpointsIssuedTokenOrder(t *testing.T) {
 	tests := []struct {
 		name      string
 		discovery []ua.EndpointDescription
+		bind      bool
 		wantErr   bool
 	}{
-		{name: "same order", discovery: endpoint(anon, jwt256, saml128, jwt128)},
-		{name: "reordered within the first issued token type", discovery: endpoint(jwt128, anon, saml128, jwt256)},
-		{name: "other issued token type moved first", discovery: endpoint(saml128, anon, jwt256, jwt128), wantErr: true},
+		{name: "same order", discovery: endpoint(anon, jwt256, saml128, jwt128), bind: true},
+		{name: "reordered within the first issued token type", discovery: endpoint(jwt128, anon, saml128, jwt256), bind: true},
+		{name: "other issued token type moved first", discovery: endpoint(saml128, anon, jwt256, jwt128), bind: true, wantErr: true},
+		{name: "other issued token type moved first, client without issued identity", discovery: endpoint(saml128, anon, jwt256, jwt128)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := verifyServerEndpoints(tt.discovery, session)
+			err := verifyServerEndpoints(tt.discovery, session, tt.bind)
 			if tt.wantErr && err != ua.BadSecurityChecksFailed {
 				t.Errorf("verifyServerEndpoints() error = %v, want %v", err, ua.BadSecurityChecksFailed)
 			}
@@ -840,6 +846,40 @@ func TestVerifyServerEndpointsIssuedTokenOrder(t *testing.T) {
 				t.Errorf("verifyServerEndpoints() error = %v, want nil", err)
 			}
 		})
+	}
+}
+
+// TestVerifyServerEndpointsLargeLists verifies that comparing large endpoint lists, which a malicious server or an
+// on-path attacker may send, takes linear time.
+func TestVerifyServerEndpointsLargeLists(t *testing.T) {
+	cert := newTestRSACertificate(t)
+	const n = 50000
+	discovered := make([]ua.EndpointDescription, n)
+	for i := range discovered {
+		tokens := make([]ua.UserTokenPolicy, 5)
+		for j := range tokens {
+			tokens[j] = userNameToken(fmt.Sprintf("user_%d_%d", i, j), ua.SecurityPolicyURIBasic256Sha256)
+		}
+		discovered[i] = testEndpoint(ua.SecurityPolicyURIBasic256Sha256, ua.MessageSecurityModeSignAndEncrypt, 1, cert, tokens...)
+	}
+	reversed := make([]ua.EndpointDescription, n)
+	for i := range reversed {
+		reversed[i] = discovered[n-1-i]
+	}
+	modified := make([]ua.EndpointDescription, n)
+	copy(modified, reversed)
+	modified[0].UserIdentityTokens = append([]ua.UserTokenPolicy(nil), modified[0].UserIdentityTokens...)
+	modified[0].UserIdentityTokens[4].SecurityPolicyURI = ua.SecurityPolicyURINone
+
+	start := time.Now()
+	if err := verifyServerEndpoints(discovered, reversed, true); err != nil {
+		t.Errorf("verifyServerEndpoints() error = %v, want nil", err)
+	}
+	if err := verifyServerEndpoints(discovered, modified, true); err != ua.BadSecurityChecksFailed {
+		t.Errorf("verifyServerEndpoints() error = %v, want %v", err, ua.BadSecurityChecksFailed)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("verifyServerEndpoints() took %s for %d endpoints", elapsed, n)
 	}
 }
 

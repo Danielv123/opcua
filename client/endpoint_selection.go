@@ -6,6 +6,8 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/awcullen/opcua/ua"
 )
@@ -283,105 +285,171 @@ func isUaTcpTransport(uri string) bool {
 // so this detects an attacker who altered it, for example to remove the more secure endpoints or to
 // weaken the user token policies. When the session's channel is secured, the CreateSessionResponse is
 // authenticated by the server certificate.
-// Only endpoints that use the UA TCP transport are compared, in any order. See endpointsMatch for the fields compared.
+//
+// Only endpoints that use the UA TCP transport are compared, in any order. The security mode, security policy uri,
+// security level, transport profile uri, and user token policies (in any order) must be equal. The server certificate
+// (compared by leaf certificate) and the server's ApplicationURI must be equal too, unless the server omitted them
+// from the endpoint returned by CreateSession. A certificate missing from discovery does not match, as an attacker
+// may have removed it. The EndpointURL is not compared, as servers may return a different host name for the same
+// endpoint, and the client always connects to the URL passed to Dial.
+//
+// If bindIssuedTokenType is true (the client uses an IssuedIdentity), the first IssuedToken policy of each endpoint
+// must also have the same IssuedTokenType and IssuerEndpointURL, since it determines the issued token policies the
+// client considers (see selectUserTokenPolicy).
+//
+// Each list is indexed once, so the time taken is linear in the size of the lists, even for a malicious response.
 // See https://reference.opcfoundation.org/v104/Core/docs/Part4/5.6.2/
-func verifyServerEndpoints(discoveryEndpoints, sessionEndpoints []ua.EndpointDescription) error {
-	// every discovered endpoint must be returned by the server.
-outer1:
-	for i := range discoveryEndpoints {
-		d := &discoveryEndpoints[i]
-		if !isUaTcpTransport(d.TransportProfileURI) {
-			continue
+func verifyServerEndpoints(discoveryEndpoints, sessionEndpoints []ua.EndpointDescription, bindIssuedTokenType bool) error {
+	discovered := newEndpointIndex(discoveryEndpoints, bindIssuedTokenType)
+	returned := newEndpointIndex(sessionEndpoints, bindIssuedTokenType)
+	// every discovered endpoint must be returned by the server, which may omit the certificate and ApplicationURI.
+	for _, d := range discovered.keys {
+		if !returned.has(d.security, d.leaf, d.applicationURI) &&
+			!returned.has(d.security, d.leaf, "") &&
+			!returned.has(d.security, "", d.applicationURI) &&
+			!returned.has(d.security, "", "") {
+			return ua.BadSecurityChecksFailed
 		}
-		for j := range sessionEndpoints {
-			if s := &sessionEndpoints[j]; isUaTcpTransport(s.TransportProfileURI) && endpointsMatch(d, s) {
-				continue outer1
-			}
-		}
-		return ua.BadSecurityChecksFailed
 	}
 	// every endpoint returned by the server must have been discovered.
-outer2:
-	for j := range sessionEndpoints {
-		s := &sessionEndpoints[j]
-		if !isUaTcpTransport(s.TransportProfileURI) {
-			continue
+	for _, s := range returned.keys {
+		if !discovered.hasMatch(s) {
+			return ua.BadSecurityChecksFailed
 		}
-		for i := range discoveryEndpoints {
-			if d := &discoveryEndpoints[i]; isUaTcpTransport(d.TransportProfileURI) && endpointsMatch(d, s) {
-				continue outer2
-			}
-		}
-		return ua.BadSecurityChecksFailed
 	}
 	return nil
 }
 
-// endpointsMatch returns true if the security relevant fields of the discovered endpoint d are equal to the
-// endpoint s returned by CreateSession: the security mode, security policy uri, security level, transport
-// profile uri, and user token policies (in any order). The server certificate and the server's ApplicationURI
-// are compared unless the server omitted them from s.
-// The EndpointURL is not compared, as servers may return a different host name for the same endpoint,
-// and the client always connects to the URL passed to Dial.
-func endpointsMatch(d, s *ua.EndpointDescription) bool {
-	if d.SecurityMode != s.SecurityMode ||
-		d.SecurityPolicyURI != s.SecurityPolicyURI ||
-		d.SecurityLevel != s.SecurityLevel ||
-		d.TransportProfileURI != s.TransportProfileURI ||
-		!sameUserTokenPolicies(d.UserIdentityTokens, s.UserIdentityTokens) {
-		return false
+// endpointKey is the normalized form of an endpoint that verifyServerEndpoints compares.
+type endpointKey struct {
+	security       string // canonical encoding of the fields that must be equal
+	leaf           string // leaf certificate, or "" if omitted
+	applicationURI string // ApplicationURI of the server, or "" if omitted
+}
+
+// endpointIndex is a set of normalized endpoints, indexed for the lookups of verifyServerEndpoints.
+type endpointIndex struct {
+	keys           []endpointKey
+	exact          map[endpointKey]struct{}
+	security       map[string]struct{}
+	leaf           map[[2]string]struct{} // security and leaf
+	applicationURI map[[2]string]struct{} // security and ApplicationURI
+}
+
+// newEndpointIndex normalizes and indexes the endpoints that use the UA TCP transport.
+func newEndpointIndex(endpoints []ua.EndpointDescription, bindIssuedTokenType bool) *endpointIndex {
+	idx := &endpointIndex{
+		keys:           make([]endpointKey, 0, len(endpoints)),
+		exact:          make(map[endpointKey]struct{}, len(endpoints)),
+		security:       make(map[string]struct{}, len(endpoints)),
+		leaf:           make(map[[2]string]struct{}, len(endpoints)),
+		applicationURI: make(map[[2]string]struct{}, len(endpoints)),
 	}
-	// servers may omit the certificates from the endpoints returned in the CreateSessionResponse.
-	// A certificate missing from discovery does not match, as an attacker may have removed it.
-	if len(s.ServerCertificate) > 0 && !sameLeafCertificate(d.ServerCertificate, s.ServerCertificate) {
-		return false
+	leaves := make(map[ua.ByteString]string) // endpoints usually share a certificate, so parse each one once.
+	for i := range endpoints {
+		e := &endpoints[i]
+		if !isUaTcpTransport(e.TransportProfileURI) {
+			continue
+		}
+		leaf, ok := leaves[e.ServerCertificate]
+		if !ok {
+			leaf = leafCertificateKey(e.ServerCertificate)
+			leaves[e.ServerCertificate] = leaf
+		}
+		k := endpointKey{
+			security:       endpointSecurityKey(e, bindIssuedTokenType),
+			leaf:           leaf,
+			applicationURI: e.Server.ApplicationURI,
+		}
+		idx.keys = append(idx.keys, k)
+		idx.exact[k] = struct{}{}
+		idx.security[k.security] = struct{}{}
+		idx.leaf[[2]string{k.security, k.leaf}] = struct{}{}
+		idx.applicationURI[[2]string{k.security, k.applicationURI}] = struct{}{}
 	}
-	if s.Server.ApplicationURI != "" && d.Server.ApplicationURI != s.Server.ApplicationURI {
-		return false
+	return idx
+}
+
+// has returns true if the index contains an endpoint with exactly these values.
+func (idx *endpointIndex) has(security, leaf, applicationURI string) bool {
+	_, ok := idx.exact[endpointKey{security, leaf, applicationURI}]
+	return ok
+}
+
+// hasMatch returns true if the index contains an endpoint that matches s, where s may omit the
+// certificate and ApplicationURI.
+func (idx *endpointIndex) hasMatch(s endpointKey) bool {
+	var ok bool
+	switch {
+	case s.leaf == "" && s.applicationURI == "":
+		_, ok = idx.security[s.security]
+	case s.applicationURI == "":
+		_, ok = idx.leaf[[2]string{s.security, s.leaf}]
+	case s.leaf == "":
+		_, ok = idx.applicationURI[[2]string{s.security, s.applicationURI}]
+	default:
+		_, ok = idx.exact[s]
 	}
-	return true
+	return ok
+}
+
+// endpointSecurityKey returns a canonical encoding of the security mode, security policy uri, security level,
+// transport profile uri and user token policies (in any order) of the endpoint. If bindIssuedTokenType is true,
+// the IssuedTokenType and IssuerEndpointURL of the first IssuedToken policy are included too.
+func endpointSecurityKey(e *ua.EndpointDescription, bindIssuedTokenType bool) string {
+	tokens := make([]string, len(e.UserIdentityTokens))
+	for i := range e.UserIdentityTokens {
+		t := &e.UserIdentityTokens[i]
+		var b strings.Builder
+		writeKeyField(&b, t.PolicyID)
+		writeKeyField(&b, strconv.Itoa(int(t.TokenType)))
+		writeKeyField(&b, t.IssuedTokenType)
+		writeKeyField(&b, t.IssuerEndpointURL)
+		writeKeyField(&b, t.SecurityPolicyURI)
+		tokens[i] = b.String()
+	}
+	sort.Strings(tokens)
+	var b strings.Builder
+	writeKeyField(&b, strconv.Itoa(int(e.SecurityMode)))
+	writeKeyField(&b, e.SecurityPolicyURI)
+	writeKeyField(&b, strconv.Itoa(int(e.SecurityLevel)))
+	writeKeyField(&b, e.TransportProfileURI)
+	writeKeyField(&b, strconv.Itoa(len(tokens)))
+	for _, t := range tokens {
+		writeKeyField(&b, t)
+	}
+	if bindIssuedTokenType {
+		if t := firstIssuedTokenPolicy(e.UserIdentityTokens); t != nil {
+			writeKeyField(&b, t.IssuedTokenType)
+			writeKeyField(&b, t.IssuerEndpointURL)
+		}
+	}
+	return b.String()
+}
+
+// writeKeyField writes a length-prefixed field, so that the encoding of different fields cannot collide.
+func writeKeyField(b *strings.Builder, s string) {
+	b.WriteString(strconv.Itoa(len(s)))
+	b.WriteByte(':')
+	b.WriteString(s)
+}
+
+// leafCertificateKey returns the leaf certificate of the certificate (or chain), so that a certificate sent with or
+// without its chain of issuer certificates has the same key. Returns "" if the certificate is empty.
+func leafCertificateKey(certificate ua.ByteString) string {
+	if len(certificate) == 0 {
+		return ""
+	}
+	if certs, err := x509.ParseCertificates([]byte(certificate)); err == nil && len(certs) > 0 {
+		return "der:" + string(certs[0].Raw)
+	}
+	return "raw:" + string(certificate)
 }
 
 // sameLeafCertificate returns true if the certificates have the same leaf certificate.
 // A certificate may be sent with or without its chain of issuer certificates.
 func sameLeafCertificate(a, b ua.ByteString) bool {
-	if a == b {
-		return true
-	}
-	ca, err := x509.ParseCertificates([]byte(a))
-	if err != nil || len(ca) == 0 {
-		return false
-	}
-	cb, err := x509.ParseCertificates([]byte(b))
-	if err != nil || len(cb) == 0 {
-		return false
-	}
-	return ca[0].Equal(cb[0])
-}
-
-// sameUserTokenPolicies returns true if the lists contain the same user token policies, in any order,
-// except that the first IssuedToken policy must have the same IssuedTokenType and IssuerEndpointURL,
-// since it determines the issued token policies the client considers (see selectUserTokenPolicy).
-func sameUserTokenPolicies(a, b []ua.UserTokenPolicy) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	used := make([]bool, len(b))
-outer:
-	for i := range a {
-		for j := range b {
-			if !used[j] && a[i] == b[j] {
-				used[j] = true
-				continue outer
-			}
-		}
-		return false
-	}
-	fa, fb := firstIssuedTokenPolicy(a), firstIssuedTokenPolicy(b)
-	if fa != nil && fb != nil && (fa.IssuedTokenType != fb.IssuedTokenType || fa.IssuerEndpointURL != fb.IssuerEndpointURL) {
-		return false
-	}
-	return true
+	return a == b || leafCertificateKey(a) == leafCertificateKey(b)
 }
 
 // firstIssuedTokenPolicy returns the first IssuedToken policy in the list, or nil.

@@ -251,7 +251,8 @@ func (ch *Client) open(ctx context.Context) error {
 
 	// verify the server's endpoints are the same as the endpoints from discovery, to detect a
 	// discovery response that was altered to downgrade the security of the connection.
-	if err := verifyServerEndpoints(ch.discoveryEndpoints, createSessionResponse.ServerEndpoints); err != nil {
+	_, issuedIdentity := ch.userIdentity.(ua.IssuedIdentity)
+	if err := verifyServerEndpoints(ch.discoveryEndpoints, createSessionResponse.ServerEndpoints, issuedIdentity); err != nil {
 		return err
 	}
 

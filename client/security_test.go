@@ -753,6 +753,47 @@ func TestDialRejectsCreateSessionEndpointMismatch(t *testing.T) {
 	}
 }
 
+// TestDialWithSecurityPolicyURIWildcard verifies that WithSecurityPolicyURI("", MessageSecurityModeInvalid), which
+// selects any policy and mode, connects to the real test server like the default selection does.
+func TestDialWithSecurityPolicyURIWildcard(t *testing.T) {
+	ctx := context.Background()
+	withClientCertificate := client.WithClientCertificatePaths("./pki/client.crt", "./pki/client.key")
+	withUserName := client.WithUserNameIdentity("root", "secret")
+	tests := []struct {
+		name     string
+		opts     []client.Option
+		wantMode ua.MessageSecurityMode
+		wantErr  error
+	}{
+		{name: "anonymous without client certificate", wantMode: ua.MessageSecurityModeNone},
+		{name: "anonymous with client certificate", opts: []client.Option{withClientCertificate}, wantMode: ua.MessageSecurityModeSignAndEncrypt},
+		{name: "user name with client certificate", opts: []client.Option{withClientCertificate, withUserName}, wantMode: ua.MessageSecurityModeSignAndEncrypt},
+		{name: "user name without client certificate", opts: []client.Option{withUserName}, wantErr: ua.BadSecurityModeRejected},
+		{name: "user name without client certificate, None accepted", opts: []client.Option{withUserName, client.WithMinSecurityMode(ua.MessageSecurityModeNone)}, wantMode: ua.MessageSecurityModeNone},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := append([]client.Option{
+				client.WithSecurityPolicyURI("", ua.MessageSecurityModeInvalid),
+				client.WithInsecureSkipVerify(),
+			}, tt.opts...)
+			ch, err := client.Dial(ctx, endpointURL, opts...)
+			if err != tt.wantErr {
+				t.Fatalf("Dial error = %v, want %v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if ch.SecurityMode() != tt.wantMode {
+				t.Errorf("SecurityMode = %s, want %s", ch.SecurityMode(), tt.wantMode)
+			}
+			if err := ch.Close(ctx); err != nil {
+				ch.Abort(ctx)
+			}
+		})
+	}
+}
+
 // TestDialDetectsStrippedEndpointsOnSecureChannel simulates an on-path attacker that removes the most secure
 // endpoints of the real test server from the discovery response, and then forwards the connection to the real
 // server. The client detects the downgrade by comparing with the endpoints returned by CreateSession, which arrive
