@@ -328,6 +328,10 @@ func (ch *serverSecureChannel) Open() error {
 		if err != nil {
 			return ua.BadSecurityChecksFailed
 		}
+		// bound the cost of the signature checks of the validation of the chain sent by the client.
+		if err := securechannel.CheckCertificateChain(certs); err != nil {
+			return err
+		}
 		err = ua.ValidateCertificate(
 			certs,
 			[]x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -1234,7 +1238,8 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 			plainHeaderSize = count - stream.Len()
 
 			// once the channel is open, a renewal must not change the channel, the security policy or
-			// the remote certificate, which is only validated when the channel is opened.
+			// the remote (leaf) certificate, which is only validated when the channel is opened. The
+			// channel keeps the validated certificate.
 			if ch.pendingTokenID != 0 {
 				if channelID != ch.channelID {
 					return nil, 0, ua.BadTCPSecureChannelUnknown
@@ -1242,13 +1247,14 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 				if securityPolicyURI != ch.securityPolicyURI {
 					return nil, 0, ua.BadSecurityPolicyRejected
 				}
-				if !bytes.Equal(remoteCertificate, ch.remoteCertificate) {
+				if securityPolicyURI != ua.SecurityPolicyURINone && !securechannel.SameLeafCertificate(remoteCertificate, ch.remoteCertificate) {
 					return nil, 0, ua.BadSecurityChecksFailed
 				}
+			} else {
+				ch.securityPolicyURI = securityPolicyURI
+				ch.remoteCertificate = remoteCertificate
+				ch.remoteCertificateThumbprint = remoteCertificateThumbprint
 			}
-			ch.securityPolicyURI = securityPolicyURI
-			ch.remoteCertificate = remoteCertificate
-			ch.remoteCertificateThumbprint = remoteCertificateThumbprint
 
 			// setSecurityPolicy
 			switch ch.securityPolicyURI {

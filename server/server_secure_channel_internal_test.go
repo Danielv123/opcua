@@ -232,6 +232,23 @@ func TestServerRejectsUnsupportedCertificate(t *testing.T) {
 	}
 }
 
+// TestServerOpenRejectsLongIssuerKey checks that a certificate chain whose issuer certificate holds a very
+// long RSA key is rejected before the chain is validated, which would verify a signature with that key.
+func TestServerOpenRejectsLongIssuerKey(t *testing.T) {
+	loadTestCredentials(t)
+	issuerKey := &rsa.PublicKey{N: new(big.Int).SetBit(big.NewInt(1), 1<<16-1, 1), E: 1<<31 - 1}
+	issuer, err := securechanneltest.NewCertificate("urn:localhost:issuer", testOtherClient.key, issuerKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, peer := newTestServerChannel(t, testServer)
+	c := testOpenChunk(testRSAPolicies[2], testClient, testServer, 1)
+	c.SenderCertificate = append(append([]byte{}, testClient.cert...), issuer...)
+	if err := openTestChannel(t, ch, peer, mustEncode(t, c)); err != ua.BadCertificatePolicyCheckFailed {
+		t.Fatalf("Open() = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
+	}
+}
+
 // TestServerRejectsShortClientKey checks that a client certificate with a key shorter than the security
 // policy allows is rejected: 1024 bit keys are allowed for Basic128Rsa15 and Basic256 only.
 func TestServerRejectsShortClientKey(t *testing.T) {
@@ -381,6 +398,20 @@ func TestServerRenewalRejectsChangedSecurity(t *testing.T) {
 	t.Run("SameSecurity", func(t *testing.T) {
 		ch, peer := open(t)
 		c := renew(testOpenChunk(p, testClient, testServer, 2))
+		c.ChannelID = ch.channelID
+		if _, _, err := readTestRequest(t, ch, peer, mustEncode(t, c)); err != nil {
+			t.Fatalf("renewal failed: %v", err)
+		}
+	})
+	t.Run("SameLeafOtherChain", func(t *testing.T) {
+		// the channel is opened with a certificate chain, and renewed with the leaf certificate only.
+		ch, peer := newTestServerChannel(t, testServer)
+		c := testOpenChunk(p, testClient, testServer, 1)
+		c.SenderCertificate = append(append([]byte{}, testClient.cert...), testOtherClient.cert...)
+		if err := openTestChannel(t, ch, peer, mustEncode(t, c)); err != nil {
+			t.Fatalf("Open() = %v", err)
+		}
+		c = renew(testOpenChunk(p, testClient, testServer, 2))
 		c.ChannelID = ch.channelID
 		if _, _, err := readTestRequest(t, ch, peer, mustEncode(t, c)); err != nil {
 			t.Fatalf("renewal failed: %v", err)

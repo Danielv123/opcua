@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"math/big"
 	"testing"
 
@@ -154,5 +155,84 @@ func TestRSAKeyLength(t *testing.T) {
 	}
 	if err := securechannel.CheckRSAKey(nil, ua.SecurityPolicyURIBasic256); err == nil {
 		t.Error("CheckRSAKey(nil) succeeded")
+	}
+}
+
+func TestCheckCertificateChain(t *testing.T) {
+	_, signer := newRSACertificate(t, 2048)
+	certificate := func(bits int) *x509.Certificate {
+		t.Helper()
+		key := &rsa.PublicKey{N: new(big.Int).SetBit(big.NewInt(1), bits-1, 1), E: 65537}
+		der, err := securechanneltest.NewCertificate("urn:test:chain", signer, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert
+	}
+	ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecdsaDER, err := securechanneltest.NewCertificate("urn:test:ecdsa", ecdsaKey, &ecdsaKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecdsaCert, err := x509.ParseCertificate(ecdsaDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf := certificate(2048)
+	cases := []struct {
+		name  string
+		chain []*x509.Certificate
+		ok    bool
+	}{
+		{"Leaf", []*x509.Certificate{leaf}, true},
+		{"Leaf4096", []*x509.Certificate{certificate(4096)}, true},
+		{"LeafTooLong", []*x509.Certificate{certificate(securechannel.MaxRSAKeyLength + 1)}, false},
+		{"Issuer8192", []*x509.Certificate{leaf, certificate(8192)}, true},
+		{"IssuerMax", []*x509.Certificate{leaf, certificate(securechannel.MaxIssuerRSAKeyLength)}, true},
+		{"IssuerTooLong", []*x509.Certificate{leaf, certificate(securechannel.MaxIssuerRSAKeyLength + 1)}, false},
+		{"IssuerHuge", []*x509.Certificate{leaf, certificate(4096), certificate(1 << 17)}, false},
+		{"ECDSA", []*x509.Certificate{ecdsaCert, leaf}, true},
+		{"Empty", nil, true},
+	}
+	for _, c := range cases {
+		err := securechannel.CheckCertificateChain(c.chain)
+		if c.ok && err != nil {
+			t.Errorf("%s: CheckCertificateChain() = %v", c.name, err)
+		}
+		if !c.ok && err != ua.BadCertificatePolicyCheckFailed {
+			t.Errorf("%s: CheckCertificateChain() = %v, want %v", c.name, err, ua.BadCertificatePolicyCheckFailed)
+		}
+	}
+}
+
+func TestSameLeafCertificate(t *testing.T) {
+	leaf, _ := newRSACertificate(t, 2048)
+	other, _ := newRSACertificate(t, 2048)
+	issuer, _ := newRSACertificate(t, 2048)
+	chain := append(append([]byte{}, leaf...), issuer...)
+	cases := []struct {
+		name string
+		a, b []byte
+		want bool
+	}{
+		{"Same", leaf, leaf, true},
+		{"SameLeafWithChain", chain, leaf, true},
+		{"SameLeafOtherChain", chain, append(append([]byte{}, leaf...), other...), true},
+		{"OtherLeaf", leaf, other, false},
+		{"OtherLeafSameChain", chain, append(append([]byte{}, other...), issuer...), false},
+		{"Invalid", leaf, []byte{1, 2, 3}, false},
+		{"Empty", nil, nil, false},
+	}
+	for _, c := range cases {
+		if got := securechannel.SameLeafCertificate(c.a, c.b); got != c.want {
+			t.Errorf("%s: SameLeafCertificate() = %v, want %v", c.name, got, c.want)
+		}
 	}
 }

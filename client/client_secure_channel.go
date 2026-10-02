@@ -284,6 +284,10 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		if err != nil || len(certs) == 0 {
 			return ua.BadSecurityChecksFailed
 		}
+		// bound the cost of the signature checks of the validation of the chain sent by the server.
+		if err := securechannel.CheckCertificateChain(certs); err != nil {
+			return err
+		}
 		err = ua.ValidateCertificate(
 			certs,
 			[]x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},

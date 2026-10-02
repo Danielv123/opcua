@@ -216,6 +216,19 @@ func TestClientRejectsKeyLengths(t *testing.T) {
 			if ch := newTestClientSecureChannel(endpointURL, p.uri, ua.MessageSecurityModeSignAndEncrypt, testClient, longCert); ch.remotePublicKey != nil {
 				t.Error("8192 bit server key was accepted")
 			}
+			// rejected before the certificate (chain) is validated.
+			if err := open(testClient, longCert); err != ua.BadCertificatePolicyCheckFailed {
+				t.Errorf("Open() with an 8192 bit server key = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
+			}
+			issuerKey := &rsa.PublicKey{N: new(big.Int).SetBit(big.NewInt(1), 1<<16-1, 1), E: 1<<31 - 1}
+			issuer, err := securechanneltest.NewCertificate("urn:localhost:issuer", testOtherServer.key, issuerKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			chain := append(append([]byte{}, testServer.cert...), issuer...)
+			if err := open(testClient, chain); err != ua.BadCertificatePolicyCheckFailed {
+				t.Errorf("Open() with a 65536 bit issuer key = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
+			}
 			long := testCredential{cert: testClient.cert, key: &rsa.PrivateKey{PublicKey: *longKey}}
 			if err := open(long, testServer.cert); err != ua.BadCertificatePolicyCheckFailed {
 				t.Errorf("Open() with an 8192 bit client key = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)

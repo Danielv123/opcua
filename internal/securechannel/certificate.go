@@ -19,6 +19,34 @@ import (
 // rejecting them would break deployments that use 4096 bit certificates with these policies.
 const MaxRSAKeyLength = 4096
 
+// MaxIssuerRSAKeyLength is the maximum length, in bits, of the RSA keys of the issuer certificates
+// in a certificate chain received from the peer. Validating the chain verifies certificate
+// signatures with these keys before the chain is known to be trusted, so their length is bounded
+// too. The limit is higher than MaxRSAKeyLength, so that chains with 8192 bit CA certificates remain
+// usable, but low enough to bound the cost of the verification.
+const MaxIssuerRSAKeyLength = 16384
+
+// CheckCertificateChain returns ua.BadCertificatePolicyCheckFailed if a certificate of a chain received
+// from the peer holds an RSA key that is too long: longer than MaxRSAKeyLength for the leaf certificate
+// (the first one), or longer than MaxIssuerRSAKeyLength for the other certificates. It must be called
+// before the chain is validated.
+func CheckCertificateChain(certificates []*x509.Certificate) error {
+	for i, certificate := range certificates {
+		key, ok := certificate.PublicKey.(*rsa.PublicKey)
+		if !ok {
+			continue
+		}
+		limit := MaxIssuerRSAKeyLength
+		if i == 0 {
+			limit = MaxRSAKeyLength
+		}
+		if key == nil || key.N == nil || key.N.BitLen() > limit {
+			return ua.BadCertificatePolicyCheckFailed
+		}
+	}
+	return nil
+}
+
 // MinRSAKeyLength returns the minimum length, in bits, of the RSA keys allowed by a security policy,
 // i.e. the minimum AsymmetricKeyLength of the policy (OPC UA Part 7): 1024 bits for the deprecated
 // Basic128Rsa15 and Basic256 policies, and 2048 bits for Basic256Sha256, Aes128_Sha256_RsaOaep and
@@ -60,6 +88,20 @@ func RSAPublicKey(certificate *x509.Certificate, securityPolicyURI string) (*rsa
 		return nil, err
 	}
 	return key, nil
+}
+
+// SameLeafCertificate returns true if the DER encoded certificates, or certificate chains, a and b
+// start with the same (leaf) certificate. The issuer certificates may differ.
+func SameLeafCertificate(a, b []byte) bool {
+	certsA, err := x509.ParseCertificates(a)
+	if err != nil || len(certsA) == 0 {
+		return false
+	}
+	certsB, err := x509.ParseCertificates(b)
+	if err != nil || len(certsB) == 0 {
+		return false
+	}
+	return certsA[0].Equal(certsB[0])
 }
 
 // ParseRSAPublicKey parses a DER encoded certificate, or certificate chain, received from the
