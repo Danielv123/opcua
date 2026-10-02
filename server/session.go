@@ -43,6 +43,7 @@ type Session struct {
 	clientCertificate                       ua.ByteString
 	verifiedApplicationURI                  string
 	createChannelId                         uint32
+	activateLock                            sync.Mutex
 	browseCPs                               map[uint32]browseCP
 	lastBrowseCP                            uint32
 	maxBrowseContinuationPoints             int

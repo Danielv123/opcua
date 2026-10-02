@@ -10,6 +10,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
@@ -23,7 +24,6 @@ import (
 	"time"
 
 	"github.com/awcullen/opcua/ua"
-	"github.com/djherbis/buffer"
 	"github.com/google/uuid"
 )
 
@@ -338,6 +338,10 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 		return nil
 	}
 
+	// activations of a session are serialized, so that each session nonce is used at most once.
+	session.activateLock.Lock()
+	defer session.activateLock.Unlock()
+
 	// the first activation must use the secure channel that created the session.
 	sessionChannelID := session.SecureChannelId()
 	if sessionChannelID == 0 && session.createChannelId != ch.ChannelID() {
@@ -362,7 +366,9 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 	}
 
 	// the secure channel must be authenticated with the client certificate of the session. once activated,
-	// the session may be transferred to a new secure channel with the same security policy and mode.
+	// the session may be transferred to a new secure channel with the same security policy and mode. A session
+	// without a client certificate cannot be transferred, since nothing proves that the new secure channel
+	// belongs to the same client.
 	clientCertificate, clientKey, ok := verifiedClientCertificate(ch)
 	if ok {
 		var raw []byte
@@ -373,6 +379,9 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 	}
 	if ok && sessionChannelID != 0 {
 		ok = ch.SecurityPolicyURI() == session.SecurityPolicyURI() && ch.SecurityMode() == session.SecurityMode()
+	}
+	if ok && sessionChannelID != 0 && sessionChannelID != ch.ChannelID() {
+		ok = clientCertificate != nil
 	}
 	if !ok {
 		srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
@@ -641,201 +650,60 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 			}
 			return nil
 		}
-		cipherBytes := []byte(userIdentityToken.Password)
 		secPolicyURI := tokenPolicy.SecurityPolicyURI
 		if secPolicyURI == "" {
 			secPolicyURI = ch.LocalEndpoint().SecurityPolicyURI
 		}
 
-		switch secPolicyURI {
-		case ua.SecurityPolicyURIBasic128Rsa15:
-			if userIdentityToken.EncryptionAlgorithm != ua.RsaV15KeyWrap {
-				srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
-				srv.serverDiagnosticsSummary.RejectedSessionCount++
-				srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
-				srv.serverDiagnosticsSummary.RejectedRequestsCount++
-				err := ch.Write(
-					&ua.ServiceFault{
-						ResponseHeader: ua.ResponseHeader{
-							Timestamp:     time.Now(),
-							RequestHandle: req.RequestHandle,
-							ServiceResult: ua.BadIdentityTokenInvalid,
-						},
-					},
-					requestid,
-				)
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
-			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
-			cipherBuf.Write(cipherBytes)
-			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
-			for cipherBuf.Len() > 0 {
-				cipherBuf.Read(cipherText)
-				// decrypt with local private key.
-				plainText, err := rsa.DecryptPKCS1v15(rand.Reader, srv.localPrivateKey, cipherText)
-				if err != nil {
-					return err
-				}
-				plainBuf.Write(plainText)
-			}
-			plainLength := uint32(0)
-			if plainBuf.Len() > 0 {
-				binary.Read(plainBuf, binary.LittleEndian, &plainLength)
-			}
-			if plainLength < 32 || plainLength > 96 {
-				err := ch.Write(
-					&ua.ServiceFault{
-						ResponseHeader: ua.ResponseHeader{
-							Timestamp:     time.Now(),
-							RequestHandle: req.RequestHandle,
-							ServiceResult: ua.BadIdentityTokenRejected,
-						},
-					},
-					requestid,
-				)
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-			passwordBytes := make([]byte, plainLength-32)
-			plainBuf.Read(passwordBytes)
-			cipherBuf.Reset()
-			plainBuf.Reset()
-			userIdentity = ua.UserNameIdentity{UserName: userIdentityToken.UserName, Password: string(passwordBytes)}
-
-		case ua.SecurityPolicyURIBasic256, ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep:
-			if userIdentityToken.EncryptionAlgorithm != ua.RsaOaepKeyWrap {
-				srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
-				srv.serverDiagnosticsSummary.RejectedSessionCount++
-				srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
-				srv.serverDiagnosticsSummary.RejectedRequestsCount++
-				err := ch.Write(
-					&ua.ServiceFault{
-						ResponseHeader: ua.ResponseHeader{
-							Timestamp:     time.Now(),
-							RequestHandle: req.RequestHandle,
-							ServiceResult: ua.BadIdentityTokenInvalid,
-						},
-					},
-					requestid,
-				)
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
-			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
-			cipherBuf.Write(cipherBytes)
-			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
-			for cipherBuf.Len() > 0 {
-				cipherBuf.Read(cipherText)
-				// decrypt with local private key.
-				plainText, err := rsa.DecryptOAEP(sha1.New(), rand.Reader, srv.localPrivateKey, cipherText, []byte{})
-				if err != nil {
-					return err
-				}
-				plainBuf.Write(plainText)
-			}
-			plainLength := uint32(0)
-			if plainBuf.Len() > 0 {
-				binary.Read(plainBuf, binary.LittleEndian, &plainLength)
-			}
-			if plainLength < 32 || plainLength > 96 {
-				err := ch.Write(
-					&ua.ServiceFault{
-						ResponseHeader: ua.ResponseHeader{
-							Timestamp:     time.Now(),
-							RequestHandle: req.RequestHandle,
-							ServiceResult: ua.BadIdentityTokenRejected,
-						},
-					},
-					requestid,
-				)
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-			passwordBytes := make([]byte, plainLength-32)
-			plainBuf.Read(passwordBytes)
-			cipherBuf.Reset()
-			plainBuf.Reset()
-			userIdentity = ua.UserNameIdentity{UserName: userIdentityToken.UserName, Password: string(passwordBytes)}
-
-		case ua.SecurityPolicyURIAes256Sha256RsaPss:
-			if userIdentityToken.EncryptionAlgorithm != ua.RsaOaepSha256KeyWrap {
-				srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
-				srv.serverDiagnosticsSummary.RejectedSessionCount++
-				srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
-				srv.serverDiagnosticsSummary.RejectedRequestsCount++
-				err := ch.Write(
-					&ua.ServiceFault{
-						ResponseHeader: ua.ResponseHeader{
-							Timestamp:     time.Now(),
-							RequestHandle: req.RequestHandle,
-							ServiceResult: ua.BadIdentityTokenInvalid,
-						},
-					},
-					requestid,
-				)
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-			plainBuf := buffer.NewPartitionAt(ch.bufferPool)
-			cipherBuf := buffer.NewPartitionAt(ch.bufferPool)
-			cipherBuf.Write(cipherBytes)
-			cipherText := make([]byte, int32(len(srv.localPrivateKey.D.Bytes())))
-			for cipherBuf.Len() > 0 {
-				cipherBuf.Read(cipherText)
-				// decrypt with local private key.
-				plainText, err := rsa.DecryptOAEP(sha256.New(), rand.Reader, srv.localPrivateKey, cipherText, []byte{})
-				if err != nil {
-					return err
-				}
-				plainBuf.Write(plainText)
-			}
-			plainLength := uint32(0)
-			if plainBuf.Len() > 0 {
-				binary.Read(plainBuf, binary.LittleEndian, &plainLength)
-			}
-			if plainLength < 32 || plainLength > 96 {
-				srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
-				srv.serverDiagnosticsSummary.RejectedSessionCount++
-				srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
-				srv.serverDiagnosticsSummary.RejectedRequestsCount++
-				err := ch.Write(
-					&ua.ServiceFault{
-						ResponseHeader: ua.ResponseHeader{
-							Timestamp:     time.Now(),
-							RequestHandle: req.RequestHandle,
-							ServiceResult: ua.BadIdentityTokenRejected,
-						},
-					},
-					requestid,
-				)
-				if err != nil {
-					return err
-				}
-				return nil
-			}
-			passwordBytes := make([]byte, plainLength-32)
-			plainBuf.Read(passwordBytes)
-			cipherBuf.Reset()
-			plainBuf.Reset()
-			userIdentity = ua.UserNameIdentity{UserName: userIdentityToken.UserName, Password: string(passwordBytes)}
-
-		default:
-			userIdentity = ua.UserNameIdentity{UserName: userIdentityToken.UserName, Password: string(cipherBytes)}
-
+		encryptionAlgorithm := userTokenEncryptionAlgorithm(secPolicyURI)
+		if encryptionAlgorithm == "" {
+			userIdentity = ua.UserNameIdentity{UserName: userIdentityToken.UserName, Password: string(userIdentityToken.Password)}
+			break
 		}
+		if userIdentityToken.EncryptionAlgorithm != encryptionAlgorithm {
+			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
+			srv.serverDiagnosticsSummary.RejectedSessionCount++
+			srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
+			srv.serverDiagnosticsSummary.RejectedRequestsCount++
+			err := ch.Write(
+				&ua.ServiceFault{
+					ResponseHeader: ua.ResponseHeader{
+						Timestamp:     time.Now(),
+						RequestHandle: req.RequestHandle,
+						ServiceResult: ua.BadIdentityTokenInvalid,
+					},
+				},
+				requestid,
+			)
+			if err != nil {
+				return err
+			}
+			return nil
+		}
+		// the password must be encrypted for the current nonce of this session. Every failure is reported alike,
+		// without revealing why, and without closing the secure channel.
+		password, ok := decryptUserTokenSecret(srv.localPrivateKey, encryptionAlgorithm, []byte(userIdentityToken.Password), []byte(session.SessionNonce()))
+		if !ok {
+			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
+			srv.serverDiagnosticsSummary.RejectedSessionCount++
+			srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
+			srv.serverDiagnosticsSummary.RejectedRequestsCount++
+			err := ch.Write(
+				&ua.ServiceFault{
+					ResponseHeader: ua.ResponseHeader{
+						Timestamp:     time.Now(),
+						RequestHandle: req.RequestHandle,
+						ServiceResult: ua.BadIdentityTokenInvalid,
+					},
+				},
+				requestid,
+			)
+			if err != nil {
+				return err
+			}
+			return nil
+		}
+		userIdentity = ua.UserNameIdentity{UserName: userIdentityToken.UserName, Password: string(password)}
 
 	case ua.AnonymousIdentityToken:
 		var tokenPolicy *ua.UserTokenPolicy
@@ -6413,4 +6281,67 @@ func sameClientUserID(a, b any) bool {
 	default:
 		return false
 	}
+}
+
+// userTokenEncryptionAlgorithm returns the algorithm that encrypts the secret of a user identity token for the
+// security policy of the user token policy, or an empty string if the secret is not encrypted.
+func userTokenEncryptionAlgorithm(securityPolicyURI string) string {
+	switch securityPolicyURI {
+	case ua.SecurityPolicyURIBasic128Rsa15:
+		return ua.RsaV15KeyWrap
+	case ua.SecurityPolicyURIBasic256, ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep:
+		return ua.RsaOaepKeyWrap
+	case ua.SecurityPolicyURIAes256Sha256RsaPss:
+		return ua.RsaOaepSha256KeyWrap
+	default:
+		return ""
+	}
+}
+
+// maxLegacySecretLength is the maximum length of a secret in the legacy encrypted token secret format.
+const maxLegacySecretLength = 64
+
+// decryptUserTokenSecret decrypts the secret of a user identity token in the legacy encrypted token secret
+// format (OPC UA Part 4, 7.40.2.2): the client encrypts length || secret || serverNonce, optionally followed by
+// zero padding, with the public key of the server. It returns false if the cipher text is not one RSA-OAEP block,
+// does not decrypt, has an invalid length or padding, has a secret longer than 64 bytes, or was not encrypted
+// with the given server nonce.
+//
+// A single block keeps the secret and the nonce together, so that blocks of other tokens cannot be spliced in.
+// It holds a 64 byte secret with server keys of 2048 bits or more; with 1024 bit keys, secrets are limited to
+// 50 bytes (RSA-OAEP with SHA-1). PKCS #1 v1.5 (RsaV15KeyWrap) is not supported, since decrypting it is prone to padding oracles. RSA-OAEP
+// decryption fails alike for every invalid padding, and a cipher text that was changed by an attacker decrypts
+// only with negligible probability.
+func decryptUserTokenSecret(key *rsa.PrivateKey, algorithm string, cipherText, serverNonce []byte) ([]byte, bool) {
+	if key == nil || len(serverNonce) == 0 || len(cipherText) != key.Size() {
+		return nil, false
+	}
+	var plainText []byte
+	var err error
+	switch algorithm {
+	case ua.RsaOaepKeyWrap:
+		plainText, err = rsa.DecryptOAEP(sha1.New(), rand.Reader, key, cipherText, nil)
+	case ua.RsaOaepSha256KeyWrap:
+		plainText, err = rsa.DecryptOAEP(sha256.New(), rand.Reader, key, cipherText, nil)
+	default:
+		return nil, false
+	}
+	if err != nil || len(plainText) < 4+len(serverNonce) {
+		return nil, false
+	}
+	// the length counts the secret and the nonce.
+	length := uint64(binary.LittleEndian.Uint32(plainText))
+	end := 4 + length
+	if length < uint64(len(serverNonce)) || length-uint64(len(serverNonce)) > maxLegacySecretLength || end > uint64(len(plainText)) {
+		return nil, false
+	}
+	// padding after the nonce must be zero.
+	padding := byte(0)
+	for _, b := range plainText[end:] {
+		padding |= b
+	}
+	if subtle.ConstantTimeCompare(plainText[end-uint64(len(serverNonce)):end], serverNonce) != 1 || padding != 0 {
+		return nil, false
+	}
+	return plainText[4 : end-uint64(len(serverNonce))], true
 }

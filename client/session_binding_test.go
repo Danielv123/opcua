@@ -349,7 +349,7 @@ func TestSessionCertificateBinding(t *testing.T) {
 		}{
 			{"Anonymous", basic256Sha256, signAndEncrypt, basic256Sha256, signAndEncrypt, nil, nil, ua.Good, true},
 			{"AnonymousSign", basic256Sha256, sign, basic256Sha256, sign, nil, nil, ua.BadSecurityModeInsufficient, false},
-			{"AnonymousNone", none, modeNone, none, modeNone, nil, nil, ua.Good, true},
+			{"AnonymousNone", none, modeNone, none, modeNone, nil, nil, ua.BadSecurityChecksFailed, false},
 			{"SameUser", basic256Sha256, sign, basic256Sha256, sign, &user1, &user1, ua.Good, true},
 			{"OtherUser", basic256Sha256, signAndEncrypt, basic256Sha256, signAndEncrypt, &user1, &user2, ua.BadIdentityChangeNotSupported, false},
 			{"OtherUserSameSubject", basic256Sha256, signAndEncrypt, basic256Sha256, signAndEncrypt, &user1, &user1Other, ua.BadIdentityChangeNotSupported, false},
@@ -483,52 +483,71 @@ func sbCreateSession(ctx context.Context, cli *Client, certificate []byte, appli
 	})
 }
 
-// sbSign signs the server certificate and nonce with key, for security policies
-// Basic256Sha256 and Aes128Sha256RsaOaep.
-func sbSign(serverCertificate ua.ByteString, serverNonce ua.ByteString, key *rsa.PrivateKey) (ua.SignatureData, error) {
-	hash := crypto.SHA256.New()
-	hash.Write([]byte(serverCertificate))
-	hash.Write([]byte(serverNonce))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash.Sum(nil))
-	if err != nil {
-		return ua.SignatureData{}, err
+// sbSign signs the server certificate and nonce with key, as required by the security policy.
+func sbSign(securityPolicyURI string, serverCertificate ua.ByteString, serverNonce ua.ByteString, key *rsa.PrivateKey) (ua.SignatureData, error) {
+	switch securityPolicyURI {
+	case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256:
+		hash := crypto.SHA1.New()
+		hash.Write([]byte(serverCertificate))
+		hash.Write([]byte(serverNonce))
+		sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA1, hash.Sum(nil))
+		return ua.SignatureData{Signature: ua.ByteString(sig), Algorithm: ua.RsaSha1Signature}, err
+	case ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep:
+		hash := crypto.SHA256.New()
+		hash.Write([]byte(serverCertificate))
+		hash.Write([]byte(serverNonce))
+		sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash.Sum(nil))
+		return ua.SignatureData{Signature: ua.ByteString(sig), Algorithm: ua.RsaSha256Signature}, err
+	case ua.SecurityPolicyURIAes256Sha256RsaPss:
+		hash := crypto.SHA256.New()
+		hash.Write([]byte(serverCertificate))
+		hash.Write([]byte(serverNonce))
+		sig, err := rsa.SignPSS(rand.Reader, key, crypto.SHA256, hash.Sum(nil), &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+		return ua.SignatureData{Signature: ua.ByteString(sig), Algorithm: ua.RsaPssSha256Signature}, err
+	default:
+		return ua.SignatureData{}, nil
 	}
-	return ua.SignatureData{Signature: ua.ByteString(sig), Algorithm: ua.RsaSha256Signature}, nil
+}
+
+// sbTokenPolicy returns the user token policy of the endpoint of c for the token type.
+func sbTokenPolicy(c sbConn, tokenType ua.UserTokenType) ua.UserTokenPolicy {
+	for _, p := range c.endpoint.UserIdentityTokens {
+		if p.TokenType == tokenType {
+			if p.SecurityPolicyURI == "" {
+				p.SecurityPolicyURI = c.endpoint.SecurityPolicyURI
+			}
+			return p
+		}
+	}
+	return ua.UserTokenPolicy{}
 }
 
 // sbActivateSession sends an ActivateSessionRequest for the session with the given authentication token
 // on the secure channel of c, signed with the key of c.app. The user identity is the X509 identity of user,
 // or anonymous if user is nil.
 func sbActivateSession(ctx context.Context, c sbConn, token ua.NodeID, serverNonce ua.ByteString, user *sbApplication) (*ua.ActivateSessionResponse, error) {
-	var signature ua.SignatureData
-	if c.endpoint.SecurityPolicyURI != ua.SecurityPolicyURINone {
-		var err error
-		if signature, err = sbSign(c.endpoint.ServerCertificate, serverNonce, c.app.key); err != nil {
-			return nil, err
-		}
+	if user == nil {
+		policy := sbTokenPolicy(c, ua.UserTokenTypeAnonymous)
+		return sbActivate(ctx, c, token, serverNonce, ua.AnonymousIdentityToken{PolicyID: policy.PolicyID}, ua.SignatureData{})
 	}
-	tokenType := ua.UserTokenTypeAnonymous
-	if user != nil {
-		tokenType = ua.UserTokenTypeCertificate
+	policy := sbTokenPolicy(c, ua.UserTokenTypeCertificate)
+	identityTokenSignature, err := sbSign(policy.SecurityPolicyURI, c.endpoint.ServerCertificate, serverNonce, user.key)
+	if err != nil {
+		return nil, err
 	}
-	var policyID string
-	for _, p := range c.endpoint.UserIdentityTokens {
-		if p.TokenType == tokenType {
-			policyID = p.PolicyID
-			break
-		}
-	}
-	var identityToken any = ua.AnonymousIdentityToken{PolicyID: policyID}
-	var identityTokenSignature ua.SignatureData
-	if user != nil {
-		identityToken = ua.X509IdentityToken{CertificateData: ua.ByteString(user.certificate), PolicyID: policyID}
-		var err error
-		if identityTokenSignature, err = sbSign(c.endpoint.ServerCertificate, serverNonce, user.key); err != nil {
-			return nil, err
-		}
+	identityToken := ua.X509IdentityToken{CertificateData: ua.ByteString(user.certificate), PolicyID: policy.PolicyID}
+	return sbActivate(ctx, c, token, serverNonce, identityToken, identityTokenSignature)
+}
+
+// sbActivate sends an ActivateSessionRequest with the given user identity token for the session with the given
+// authentication token on the secure channel of c, signed with the key of c.app.
+func sbActivate(ctx context.Context, c sbConn, token ua.NodeID, serverNonce ua.ByteString, identityToken any, identityTokenSignature ua.SignatureData) (*ua.ActivateSessionResponse, error) {
+	signature, err := sbSign(c.endpoint.SecurityPolicyURI, c.endpoint.ServerCertificate, serverNonce, c.app.key)
+	if err != nil {
+		return nil, err
 	}
 	var res *ua.ActivateSessionResponse
-	err := sbWithToken(c.cli, token, func() error {
+	err = sbWithToken(c.cli, token, func() error {
 		var err error
 		res, err = c.cli.activateSession(ctx, &ua.ActivateSessionRequest{
 			ClientSignature:    signature,

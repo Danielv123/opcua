@@ -1002,7 +1002,7 @@ func (srv *Server) buildEndpointDescriptions() []ua.EndpointDescription {
 			toks = append(toks, ua.UserTokenPolicy{
 				PolicyID:          fmt.Sprintf("%s_%d", ua.UserTokenTypeUserName, len(eds)),
 				TokenType:         ua.UserTokenTypeUserName,
-				SecurityPolicyURI: uri,
+				SecurityPolicyURI: passwordSecurityPolicyURI(uri),
 			})
 		}
 		if srv.x509IdentityAuthenticator != nil {
@@ -1036,7 +1036,7 @@ func (srv *Server) buildEndpointDescriptions() []ua.EndpointDescription {
 			toks = append(toks, ua.UserTokenPolicy{
 				PolicyID:          fmt.Sprintf("%s_%d", ua.UserTokenTypeUserName, len(eds)),
 				TokenType:         ua.UserTokenTypeUserName,
-				SecurityPolicyURI: uri,
+				SecurityPolicyURI: passwordSecurityPolicyURI(uri),
 			})
 		}
 		if srv.x509IdentityAuthenticator != nil {
@@ -1058,6 +1058,16 @@ func (srv *Server) buildEndpointDescriptions() []ua.EndpointDescription {
 		})
 	}
 	return eds
+}
+
+// passwordSecurityPolicyURI returns the security policy that encrypts passwords on endpoints with the given
+// security policy. Passwords are encrypted with RSA-OAEP on Basic128Rsa15 endpoints too, since decrypting
+// PKCS #1 v1.5 is prone to padding oracles. Basic256 uses RSA-OAEP and allows the key sizes of Basic128Rsa15.
+func passwordSecurityPolicyURI(securityPolicyURI string) string {
+	if securityPolicyURI == ua.SecurityPolicyURIBasic128Rsa15 {
+		return ua.SecurityPolicyURIBasic256
+	}
+	return securityPolicyURI
 }
 
 // getNextChannelID gets next id in sequence, skipping zero.
