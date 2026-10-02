@@ -12,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -555,6 +556,22 @@ func TestSelectEndpoint(t *testing.T) {
 			wantPolicy: b256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "x509_1",
 		},
 		{
+			name: "x509 identity without key does not use a token policy that signs",
+			opts: []Option{withClientCert, WithX509Identity(clientCert, nil)},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 5, serverCert, x509Token("x509_0", aes256), x509Token("x509_1", none)),
+			},
+			wantPolicy: b256, wantMode: ua.MessageSecurityModeSignAndEncrypt, wantToken: "x509_1",
+		},
+		{
+			name: "x509 identity without key is rejected if every token policy signs",
+			opts: []Option{withClientCert, WithX509Identity(clientCert, nil)},
+			endpoints: []ua.EndpointDescription{
+				testEndpoint(b256, ua.MessageSecurityModeSignAndEncrypt, 5, serverCert, x509Token("x509_0", aes256)),
+			},
+			wantErr: ua.BadIdentityTokenRejected,
+		},
+		{
 			name: "issued token policies of other token types are not considered",
 			opts: []Option{withClientCert, WithIssuedIdentity([]byte("token"))},
 			endpoints: []ua.EndpointDescription{
@@ -850,7 +867,7 @@ func TestVerifyServerEndpointsIssuedTokenOrder(t *testing.T) {
 }
 
 // TestVerifyServerEndpointsLargeLists verifies that comparing large endpoint lists, which a malicious server or an
-// on-path attacker may send, takes linear time.
+// on-path attacker may send, does not compare every pair of endpoints.
 func TestVerifyServerEndpointsLargeLists(t *testing.T) {
 	cert := newTestRSACertificate(t)
 	const n = 50000
@@ -880,6 +897,26 @@ func TestVerifyServerEndpointsLargeLists(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
 		t.Errorf("verifyServerEndpoints() took %s for %d endpoints", elapsed, n)
+	}
+}
+
+// TestSelectEndpointLargeCertificateAndTokenList verifies that a large server certificate chain is parsed once,
+// not once for every user token policy, when a malicious discovery response also contains many token policies.
+func TestSelectEndpointLargeCertificateAndTokenList(t *testing.T) {
+	cert := newTestRSACertificate(t)
+	chain := ua.ByteString(strings.Repeat(string(cert), 200))
+	tokens := make([]ua.UserTokenPolicy, 20000)
+	for i := range tokens {
+		tokens[i] = userNameToken(fmt.Sprintf("user_%d", i), ua.SecurityPolicyURIBasic256Sha256)
+	}
+	cli := newTestClient(t, WithUserNameIdentity("user", "password"), WithMinSecurityMode(ua.MessageSecurityModeNone))
+	start := time.Now()
+	e, tok, err := cli.selectEndpoint([]ua.EndpointDescription{testEndpoint(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone, 0, chain, tokens...)})
+	if err != nil || e == nil || tok == nil || tok.PolicyID != "user_0" {
+		t.Fatalf("selectEndpoint() = %v, %v, %v", e, tok, err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("selectEndpoint() took %s", elapsed)
 	}
 }
 

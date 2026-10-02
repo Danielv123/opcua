@@ -38,6 +38,7 @@ func (ch *Client) selectEndpoint(endpoints []ua.EndpointDescription) (*ua.Endpoi
 	})
 
 	minSecurityMode := ch.effectiveMinSecurityMode()
+	keySizes := make(map[ua.ByteString]int) // RSA key size of each distinct server certificate, so each is parsed once.
 	var reason error = ua.BadSecurityModeRejected
 	var selected *ua.EndpointDescription
 	var selectedTokenPolicy *ua.UserTokenPolicy
@@ -80,10 +81,15 @@ func (ch *Client) selectEndpoint(endpoints []ua.EndpointDescription) (*ua.Endpoi
 		}
 		// a secured channel must be authenticated with the server certificate.
 		// An attacker may remove the certificate to force a weaker endpoint, so fail rather than skip it.
-		if e.SecurityMode != ua.MessageSecurityModeNone && !isUsableCertificate(e.ServerCertificate, e.SecurityPolicyURI) {
+		serverKeySize, ok := keySizes[e.ServerCertificate]
+		if !ok {
+			serverKeySize = rsaKeySize(e.ServerCertificate)
+			keySizes[e.ServerCertificate] = serverKeySize
+		}
+		if e.SecurityMode != ua.MessageSecurityModeNone && serverKeySize < minRSAKeySize(e.SecurityPolicyURI) {
 			return nil, nil, ua.BadCertificateInvalid
 		}
-		tokenPolicy, err := ch.selectUserTokenPolicy(e)
+		tokenPolicy, err := ch.selectUserTokenPolicy(e, serverKeySize)
 		if err != nil {
 			// the server certificate needed to encrypt the user token is missing or unusable.
 			if err == ua.BadCertificateInvalid {
@@ -142,10 +148,11 @@ func (ch *Client) effectiveMinSecurityMode() ua.MessageSecurityMode {
 // token is preferred over one that does not. A token policy with an unsupported security policy uri is never used.
 // If the server certificate needed to encrypt the secret is missing or unusable for a token policy stronger than
 // the selected one, selection fails with BadCertificateInvalid, rather than falling back to a weaker token policy.
-// An X509 identity's token is signed with the identity's key, which must be large enough for the token policy.
+// An X509 identity's token is signed with the identity's key, which must be present and large enough for the token policy.
+// serverKeySize is the size in bits of the RSA key of the endpoint's server certificate, or 0 if it is not usable.
 // For an IssuedIdentity, only token policies with the same IssuedTokenType and IssuerEndpointURL as the first
 // IssuedToken policy are considered, since the token data is only valid for one token type.
-func (ch *Client) selectUserTokenPolicy(e *ua.EndpointDescription) (*ua.UserTokenPolicy, error) {
+func (ch *Client) selectUserTokenPolicy(e *ua.EndpointDescription, serverKeySize int) (*ua.UserTokenPolicy, error) {
 	var tokenType ua.UserTokenType
 	var secret bool
 	var signingKey *rsa.PrivateKey
@@ -189,14 +196,14 @@ func (ch *Client) selectUserTokenPolicy(e *ua.EndpointDescription) (*ua.UserToke
 			}
 		default:
 			// a secret is encrypted with the server certificate.
-			if secret && !isUsableCertificate(e.ServerCertificate, policyURI) {
+			if secret && serverKeySize < minRSAKeySize(policyURI) {
 				if strength > certificateRejected {
 					certificateRejected = strength
 				}
 				continue
 			}
-			// the X509 identity's key signs the token, so it must be large enough for the policy.
-			if signingKey != nil && signingKey.N.BitLen() < minRSAKeySize(policyURI) {
+			// the X509 identity's key signs the token, so it must be present and large enough for the policy.
+			if tokenType == ua.UserTokenTypeCertificate && (signingKey == nil || signingKey.N.BitLen() < minRSAKeySize(policyURI)) {
 				continue
 			}
 		}
@@ -252,15 +259,18 @@ func securityPolicyStrength(uri string) int {
 	}
 }
 
-// isUsableCertificate returns true if the certificate (or chain) can be parsed, and the leaf has an RSA public key
-// at least as large as the security policy requires.
-func isUsableCertificate(certificate ua.ByteString, securityPolicyURI string) bool {
+// rsaKeySize returns the size in bits of the RSA public key of the leaf certificate of the certificate (or chain),
+// or 0 if the certificate cannot be parsed or the key is not an RSA key.
+func rsaKeySize(certificate ua.ByteString) int {
 	certs, err := x509.ParseCertificates([]byte(certificate))
 	if err != nil || len(certs) == 0 {
-		return false
+		return 0
 	}
 	key, ok := certs[0].PublicKey.(*rsa.PublicKey)
-	return ok && key.N.BitLen() >= minRSAKeySize(securityPolicyURI)
+	if !ok {
+		return 0
+	}
+	return key.N.BitLen()
 }
 
 // minRSAKeySize returns the minimum RSA key size in bits that the security policy requires.
@@ -297,7 +307,8 @@ func isUaTcpTransport(uri string) bool {
 // must also have the same IssuedTokenType and IssuerEndpointURL, since it determines the issued token policies the
 // client considers (see selectUserTokenPolicy).
 //
-// Each list is indexed once, so the time taken is linear in the size of the lists, even for a malicious response.
+// Each list is normalized and indexed once, rather than comparing every pair of endpoints, so even for a malicious
+// response the time taken is O(n log n) in the size of the lists (sorting the token policies of each endpoint).
 // See https://reference.opcfoundation.org/v104/Core/docs/Part4/5.6.2/
 func verifyServerEndpoints(discoveryEndpoints, sessionEndpoints []ua.EndpointDescription, bindIssuedTokenType bool) error {
 	discovered := newEndpointIndex(discoveryEndpoints, bindIssuedTokenType)
