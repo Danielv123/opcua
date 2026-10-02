@@ -12,6 +12,7 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"fmt"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -78,6 +79,7 @@ func hardeningServerURL(t *testing.T) string {
 				certFile, keyFile, endpointURL,
 				server.WithSecurityPolicyNone(true),
 				server.WithAnonymousIdentity(true),
+				server.WithAuthenticateX509IdentityFunc(func(ua.X509Identity, string, string) error { return nil }),
 				server.WithInsecureSkipVerify(),
 			)
 			if err != nil {
@@ -373,6 +375,67 @@ func TestSecureChannelRejectsNonRSACertificate(t *testing.T) {
 	}
 	if code := expectRejected(t, conn); code != ua.BadCertificatePolicyCheckFailed {
 		t.Errorf("got %v, want %v", code, ua.BadCertificatePolicyCheckFailed)
+	}
+	checkServerAvailable(t, endpointURL)
+}
+
+// TestActivateSessionRejectsInvalidIdentityCertificate activates sessions with X509 identity tokens whose
+// certificates hold a huge or an undersized RSA key, and checks that the server rejects them quickly,
+// before it uses the key, and remains available (issue #1).
+func TestActivateSessionRejectsInvalidIdentityCertificate(t *testing.T) {
+	endpointURL := hardeningServerURL(t)
+	identityKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validCert, err := securechanneltest.NewCertificate("urn:localhost:user", identityKey, &identityKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hugeKey := &rsa.PublicKey{N: new(big.Int).SetBit(big.NewInt(1), 1<<20-1, 1), E: 1<<31 - 1}
+	hugeCert, err := securechanneltest.NewCertificate("urn:localhost:user", identityKey, hugeKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortKey, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortCert, err := securechanneltest.NewCertificate("urn:localhost:user", shortKey, &shortKey.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dial := func(cert []byte, key *rsa.PrivateKey) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c, err := client.Dial(ctx, endpointURL,
+			client.WithSecurityPolicyURI(ua.SecurityPolicyURIBasic256Sha256, ua.MessageSecurityModeSignAndEncrypt),
+			client.WithClientCertificate(hardeningClientCert, hardeningClientKey),
+			client.WithInsecureSkipVerify(),
+			client.WithX509Identity(cert, key),
+		)
+		if err == nil {
+			c.Close(ctx)
+		}
+		return err
+	}
+
+	// a valid identity is accepted.
+	if err := dial(validCert, identityKey); err != nil {
+		t.Fatalf("Dial() with a valid identity = %v", err)
+	}
+	// a certificate with a 1 megabit modulus is rejected before the signature is verified with it.
+	start := time.Now()
+	if err := dial(hugeCert, identityKey); err != ua.BadIdentityTokenInvalid {
+		t.Errorf("Dial() with a huge identity key = %v, want %v", err, ua.BadIdentityTokenInvalid)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("Dial() with a huge identity key took %v", d)
+	}
+	// a certificate with a 1024 bit key is rejected for the Basic256Sha256 token policy. The token is
+	// signed with a longer key, so that a client that checks its own key still sends it.
+	if err := dial(shortCert, identityKey); err != ua.BadIdentityTokenInvalid {
+		t.Errorf("Dial() with a 1024 bit identity key = %v, want %v", err, ua.BadIdentityTokenInvalid)
 	}
 	checkServerAvailable(t, endpointURL)
 }

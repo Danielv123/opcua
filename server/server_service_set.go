@@ -420,29 +420,9 @@ func (srv *Server) handleActivateSession(ch *serverSecureChannel, requestid uint
 		if secPolicyURI == "" {
 			secPolicyURI = ch.SecurityPolicyURI()
 		}
-		userCerts, err := x509.ParseCertificates([]byte(userIdentityToken.CertificateData))
-		if err != nil || len(userCerts) == 0 {
-			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
-			srv.serverDiagnosticsSummary.RejectedSessionCount++
-			srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
-			srv.serverDiagnosticsSummary.RejectedRequestsCount++
-			err := ch.Write(
-				&ua.ServiceFault{
-					ResponseHeader: ua.ResponseHeader{
-						Timestamp:     time.Now(),
-						RequestHandle: req.RequestHandle,
-						ServiceResult: ua.BadIdentityTokenInvalid,
-					},
-				},
-				requestid,
-			)
-			if err != nil {
-				return err
-			}
-			return nil
-		}
-		userKey, ok := userCerts[0].PublicKey.(*rsa.PublicKey)
-		if !ok {
+		// check the certificate and its key before the key is used to verify the token signature.
+		userKey, err := userIdentityCertificateKey([]byte(userIdentityToken.CertificateData), secPolicyURI)
+		if err != nil {
 			srv.serverDiagnosticsSummary.SecurityRejectedSessionCount++
 			srv.serverDiagnosticsSummary.RejectedSessionCount++
 			srv.serverDiagnosticsSummary.SecurityRejectedRequestsCount++
