@@ -3,7 +3,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -14,7 +13,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"sort"
 
 	"github.com/awcullen/opcua/ua"
 	"github.com/djherbis/buffer"
@@ -25,6 +23,13 @@ var (
 )
 
 // Dial returns a secure channel to the OPC UA server with the given URL and options.
+//
+// Dial selects the endpoint from the server's endpoint descriptions. They are obtained over an
+// unsecured discovery channel, so the selected endpoint must satisfy the requested security policy
+// and mode (WithSecurityPolicyURI) and the minimum security mode (WithMinSecurityMode), and the
+// endpoints are verified against the endpoints returned by CreateSession. Credentials are never
+// sent in plaintext unless WithInsecurePlaintextCredentials is given, and the server certificate is
+// validated against the trusted certificates unless WithInsecureSkipVerify is given.
 func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, err error) {
 
 	cli := &Client{
@@ -60,46 +65,18 @@ func Dial(ctx context.Context, endpointURL string, opts ...Option) (c *Client, e
 		return nil, err
 	}
 
-	// order endpoints by decreasing security level.
-	var orderedEndpoints = res.Endpoints
-	sort.Slice(orderedEndpoints, func(i, j int) bool {
-		return orderedEndpoints[i].SecurityLevel > orderedEndpoints[j].SecurityLevel
-	})
-
-	// if client certificate is not set then limit secuity policy to none
-	securityPolicyURI := cli.securityPolicyURI
-	securityMode := cli.securityMode
-	if securityPolicyURI == ua.SecurityPolicyURIBestAvailable && len(cli.localCertificate) == 0 {
-		securityPolicyURI = ua.SecurityPolicyURINone
-		securityMode = ua.MessageSecurityModeNone
+	// select an endpoint that satisfies the client's security requirements. The discovery response
+	// is not authenticated, so it is verified later against the endpoints returned by CreateSession.
+	selectedEndpoint, tokenPolicy, err := cli.selectEndpoint(res.Endpoints)
+	if err != nil {
+		return nil, err
 	}
 
-	// select first endpoint with matching policy uri and security mode.
-	var selectedEndpoint *ua.EndpointDescription
-	for _, e := range orderedEndpoints {
-		// filter out unsupported policy uri
-		switch e.SecurityPolicyURI {
-		case ua.SecurityPolicyURINone, ua.SecurityPolicyURIBasic128Rsa15,
-			ua.SecurityPolicyURIBasic256, ua.SecurityPolicyURIBasic256Sha256,
-			ua.SecurityPolicyURIAes128Sha256RsaOaep, ua.SecurityPolicyURIAes256Sha256RsaPss:
-		default:
-			continue
-		}
-		// if policy uri is a match
-		if (securityPolicyURI == "" || e.SecurityPolicyURI == securityPolicyURI) &&
-			(securityMode == ua.MessageSecurityModeInvalid || e.SecurityMode == securityMode) {
-			selectedEndpoint = &e
-			break
-		}
-	}
-	if selectedEndpoint == nil {
-		return nil, ua.BadSecurityModeRejected
-	}
-
+	cli.discoveryEndpoints = res.Endpoints
 	cli.securityPolicyURI = selectedEndpoint.SecurityPolicyURI
 	cli.securityMode = selectedEndpoint.SecurityMode
 	cli.serverCertificate = []byte(selectedEndpoint.ServerCertificate)
-	cli.userTokenPolicies = selectedEndpoint.UserIdentityTokens
+	cli.userTokenPolicy = tokenPolicy
 
 	cli.localDescription = ua.ApplicationDescription{
 		ApplicationName: ua.LocalizedText{Text: cli.applicationName},
@@ -159,8 +136,11 @@ type Client struct {
 	endpointURL                          string
 	securityPolicyURI                    string
 	securityMode                         ua.MessageSecurityMode
+	minSecurityMode                      ua.MessageSecurityMode
+	allowPlaintextCredentials            bool
 	serverCertificate                    []byte
-	userTokenPolicies                    []ua.UserTokenPolicy
+	discoveryEndpoints                   []ua.EndpointDescription
+	userTokenPolicy                      *ua.UserTokenPolicy
 	userIdentity                         any
 	sessionID                            ua.NodeID
 	sessionName                          string
@@ -260,9 +240,20 @@ func (ch *Client) open(ctx context.Context) error {
 	ch.sessionTimeout = createSessionResponse.RevisedSessionTimeout
 	ch.channel.maxRequestMessageSize = createSessionResponse.MaxRequestMessageSize
 
-	// verify the server's certificate is the same as the certificate from the selected endpoint.
-	if !bytes.Equal(ch.serverCertificate, []byte(createSessionResponse.ServerCertificate)) {
+	// verify the server's certificate is the same as the certificate from the selected endpoint,
+	// which is the certificate used to open the secure channel. The certificate may be sent with
+	// or without its chain of issuer certificates, so the leaf certificates are compared.
+	if !sameLeafCertificate(ua.ByteString(ch.serverCertificate), createSessionResponse.ServerCertificate) {
 		return ua.BadCertificateInvalid
+	}
+	// the client and user token signatures are calculated over the certificate returned by CreateSession.
+	serverCertificate := []byte(createSessionResponse.ServerCertificate)
+
+	// verify the server's endpoints are the same as the endpoints from discovery, to detect a
+	// discovery response that was altered to downgrade the security of the connection.
+	_, issuedIdentity := ch.userIdentity.(ua.IssuedIdentity)
+	if err := verifyServerEndpoints(ch.discoveryEndpoints, createSessionResponse.ServerEndpoints, issuedIdentity); err != nil {
+		return err
 	}
 
 	// verify the server's signature.
@@ -303,7 +294,7 @@ func (ch *Client) open(ctx context.Context) error {
 	switch ch.securityPolicyURI {
 	case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256:
 		hash := crypto.SHA1.New()
-		hash.Write(ch.serverCertificate)
+		hash.Write(serverCertificate)
 		hash.Write(remoteNonce)
 		hashed := hash.Sum(nil)
 		signature, err := rsa.SignPKCS1v15(rand.Reader, ch.channel.localPrivateKey, crypto.SHA1, hashed)
@@ -317,7 +308,7 @@ func (ch *Client) open(ctx context.Context) error {
 
 	case ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep:
 		hash := crypto.SHA256.New()
-		hash.Write(ch.serverCertificate)
+		hash.Write(serverCertificate)
 		hash.Write(remoteNonce)
 		hashed := hash.Sum(nil)
 		signature, err := rsa.SignPKCS1v15(rand.Reader, ch.channel.localPrivateKey, crypto.SHA256, hashed)
@@ -331,7 +322,7 @@ func (ch *Client) open(ctx context.Context) error {
 
 	case ua.SecurityPolicyURIAes256Sha256RsaPss:
 		hash := crypto.SHA256.New()
-		hash.Write(ch.serverCertificate)
+		hash.Write(serverCertificate)
 		hash.Write(remoteNonce)
 		hashed := hash.Sum(nil)
 		signature, err := rsa.SignPSS(rand.Reader, ch.channel.localPrivateKey, crypto.SHA256, hashed, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
@@ -353,14 +344,8 @@ func (ch *Client) open(ctx context.Context) error {
 	switch ui := ch.userIdentity.(type) {
 
 	case ua.IssuedIdentity:
-		var tokenPolicy *ua.UserTokenPolicy
-		for _, t := range ch.userTokenPolicies {
-			if t.TokenType == ua.UserTokenTypeIssuedToken {
-				tokenPolicy = &t
-				break
-			}
-		}
-		if tokenPolicy == nil {
+		tokenPolicy := ch.userTokenPolicy
+		if tokenPolicy == nil || tokenPolicy.TokenType != ua.UserTokenTypeIssuedToken {
 			return ua.BadIdentityTokenRejected
 		}
 
@@ -463,24 +448,25 @@ func (ch *Client) open(ctx context.Context) error {
 			}
 			identityTokenSignature = ua.SignatureData{}
 
-		default:
+		case ua.SecurityPolicyURINone:
+			// never send the token in plaintext, unless the channel is encrypted or the caller allowed it.
+			if ch.securityMode != ua.MessageSecurityModeSignAndEncrypt && !ch.allowPlaintextCredentials {
+				return ua.BadSecurityModeInsufficient
+			}
 			identityToken = ua.IssuedIdentityToken{
 				TokenData:           ui.TokenData,
 				EncryptionAlgorithm: "",
 				PolicyID:            tokenPolicy.PolicyID,
 			}
 			identityTokenSignature = ua.SignatureData{}
+
+		default:
+			return ua.BadIdentityTokenRejected
 		}
 
 	case ua.X509Identity:
-		var tokenPolicy *ua.UserTokenPolicy
-		for _, t := range ch.userTokenPolicies {
-			if t.TokenType == ua.UserTokenTypeCertificate {
-				tokenPolicy = &t
-				break
-			}
-		}
-		if tokenPolicy == nil {
+		tokenPolicy := ch.userTokenPolicy
+		if tokenPolicy == nil || tokenPolicy.TokenType != ua.UserTokenTypeCertificate {
 			return ua.BadIdentityTokenRejected
 		}
 
@@ -492,7 +478,7 @@ func (ch *Client) open(ctx context.Context) error {
 		switch secPolicyURI {
 		case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256:
 			hash := crypto.SHA1.New()
-			hash.Write(ch.serverCertificate)
+			hash.Write(serverCertificate)
 			hash.Write(remoteNonce)
 			hashed := hash.Sum(nil)
 			signature, err := rsa.SignPKCS1v15(rand.Reader, ui.Key, crypto.SHA1, hashed)
@@ -510,7 +496,7 @@ func (ch *Client) open(ctx context.Context) error {
 
 		case ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep:
 			hash := crypto.SHA256.New()
-			hash.Write(ch.serverCertificate)
+			hash.Write(serverCertificate)
 			hash.Write(remoteNonce)
 			hashed := hash.Sum(nil)
 			signature, err := rsa.SignPKCS1v15(rand.Reader, ui.Key, crypto.SHA256, hashed)
@@ -528,7 +514,7 @@ func (ch *Client) open(ctx context.Context) error {
 
 		case ua.SecurityPolicyURIAes256Sha256RsaPss:
 			hash := crypto.SHA256.New()
-			hash.Write(ch.serverCertificate)
+			hash.Write(serverCertificate)
 			hash.Write(remoteNonce)
 			hashed := hash.Sum(nil)
 			signature, err := rsa.SignPSS(rand.Reader, ui.Key, crypto.SHA256, hashed, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
@@ -553,14 +539,8 @@ func (ch *Client) open(ctx context.Context) error {
 		}
 
 	case ua.UserNameIdentity:
-		var tokenPolicy *ua.UserTokenPolicy
-		for _, t := range ch.userTokenPolicies {
-			if t.TokenType == ua.UserTokenTypeUserName {
-				tokenPolicy = &t
-				break
-			}
-		}
-		if tokenPolicy == nil {
+		tokenPolicy := ch.userTokenPolicy
+		if tokenPolicy == nil || tokenPolicy.TokenType != ua.UserTokenTypeUserName {
 			return ua.BadIdentityTokenRejected
 		}
 
@@ -670,7 +650,11 @@ func (ch *Client) open(ctx context.Context) error {
 			}
 			identityTokenSignature = ua.SignatureData{}
 
-		default:
+		case ua.SecurityPolicyURINone:
+			// never send the password in plaintext, unless the channel is encrypted or the caller allowed it.
+			if ch.securityMode != ua.MessageSecurityModeSignAndEncrypt && !ch.allowPlaintextCredentials {
+				return ua.BadSecurityModeInsufficient
+			}
 			identityToken = ua.UserNameIdentityToken{
 				UserName:            ui.UserName,
 				Password:            ua.ByteString(passwordBytes),
@@ -678,17 +662,14 @@ func (ch *Client) open(ctx context.Context) error {
 				PolicyID:            tokenPolicy.PolicyID,
 			}
 			identityTokenSignature = ua.SignatureData{}
+
+		default:
+			return ua.BadIdentityTokenRejected
 		}
 
 	default:
-		var tokenPolicy *ua.UserTokenPolicy
-		for _, t := range ch.userTokenPolicies {
-			if t.TokenType == ua.UserTokenTypeAnonymous {
-				tokenPolicy = &t
-				break
-			}
-		}
-		if tokenPolicy == nil {
+		tokenPolicy := ch.userTokenPolicy
+		if tokenPolicy == nil || tokenPolicy.TokenType != ua.UserTokenTypeAnonymous {
 			return ua.BadIdentityTokenRejected
 		}
 

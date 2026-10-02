@@ -13,11 +13,50 @@ import (
 // Option is a functional option to be applied to a client during initialization.
 type Option func(*Client) error
 
-// WithSecurityPolicyURI selects endpoint with given security policy URI and MessageSecurityMode. (default: "" selects most secure endpoint)
+// WithSecurityPolicyURI selects endpoint with given security policy URI and MessageSecurityMode.
+// An empty uri selects any policy, and MessageSecurityModeInvalid selects any mode.
+// Dial fails with BadSecurityModeRejected if the server does not offer a matching endpoint,
+// rather than connecting to a weaker one. Secured endpoints require a client certificate.
+// (default: "" and MessageSecurityModeInvalid selects the most secure endpoint)
 func WithSecurityPolicyURI(uri string, securityMode ua.MessageSecurityMode) Option {
 	return func(c *Client) error {
 		c.securityPolicyURI = uri
 		c.securityMode = securityMode
+		return nil
+	}
+}
+
+// WithMinSecurityMode sets the minimum MessageSecurityMode of the endpoint that Dial connects to.
+// The endpoint descriptions returned by discovery are not authenticated, so an on-path attacker may
+// remove the secured endpoints from the list. Endpoints weaker than the minimum are never selected,
+// and Dial fails with BadSecurityModeRejected if no endpoint satisfies the minimum.
+// The minimum also applies to an endpoint requested with WithSecurityPolicyURI.
+// (default: MessageSecurityModeSign if the user identity is a UserName, Issued or X509 identity and the
+// endpoint is selected automatically; otherwise MessageSecurityModeNone)
+// A secured channel requires a client certificate. Without one, a client with credentials must accept
+// an unsecured channel explicitly with WithMinSecurityMode(ua.MessageSecurityModeNone), or by requesting
+// the endpoint with WithSecurityPolicyURI(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone). On an
+// unsecured channel an on-path attacker cannot read an encrypted password, but can relay the user token
+// to the server to take over the session.
+func WithMinSecurityMode(securityMode ua.MessageSecurityMode) Option {
+	return func(c *Client) error {
+		switch securityMode {
+		case ua.MessageSecurityModeNone, ua.MessageSecurityModeSign, ua.MessageSecurityModeSignAndEncrypt:
+		default:
+			return ua.BadInvalidArgument
+		}
+		c.minSecurityMode = securityMode
+		return nil
+	}
+}
+
+// WithInsecurePlaintextCredentials allows the password of a UserNameIdentity, or the token of an IssuedIdentity,
+// to be sent to the server without encryption, i.e. when the server's user token policy has security policy None
+// and the secure channel is not SignAndEncrypt. INSECURE: anyone who can observe the network traffic can read the
+// credentials. By default, Dial never sends credentials in plaintext, and fails with BadSecurityModeInsufficient.
+func WithInsecurePlaintextCredentials() Option {
+	return func(c *Client) error {
+		c.allowPlaintextCredentials = true
 		return nil
 	}
 }
@@ -176,6 +215,9 @@ func WithRejectedCertificatesPath(path string) Option {
 }
 
 // WithInsecureSkipVerify skips verification of server certificate. Skips checking HostName, Expiration, and Authority.
+// INSECURE: the server is not authenticated, so an on-path attacker can impersonate the server, and can receive
+// user credentials encrypted with the attacker's certificate. Without this option, the server certificate is
+// always validated against the trusted certificates before it is used to secure the channel or to encrypt a user token.
 func WithInsecureSkipVerify() Option {
 	return func(c *Client) error {
 		c.suppressHostNameInvalid = true
