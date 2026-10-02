@@ -85,6 +85,16 @@ type BinaryDecoder struct {
 	// elements were decoded.
 	reserved int64
 
+	// limits limit the memory of the decoded values.
+	limits DecodingLimits
+	// used is the memory of the decoded values.
+	used int64
+	// allowed is the memory the decoded values may take, as last computed.
+	allowed int64
+	// limitExceeded reports whether a limit was exceeded while decoding the
+	// outermost value.
+	limitExceeded bool
+
 	// depth is the current nesting depth of Variants, DataValues, ExtensionObjects
 	// and DiagnosticInfos.
 	depth int
@@ -97,13 +107,19 @@ type BinaryDecoder struct {
 // ByteStrings and arrays whose encoded length exceeds the unread bytes are rejected
 // before memory is allocated for them. Otherwise, memory for long Strings,
 // ByteStrings and arrays is allocated as their contents are read.
+//
+// The memory of the decoded values is limited by DefaultDecodingLimits, or by the
+// limits of ec, if it implements DecodingLimitsProvider.
 func NewBinaryDecoder(r io.Reader, ec EncodingContext) *BinaryDecoder {
-	dec := &BinaryDecoder{r: r, ec: ec, sampledAt: -1, limit: math.MaxInt64}
+	dec := &BinaryDecoder{r: r, ec: ec, sampledAt: -1, limit: math.MaxInt64, limits: DefaultDecodingLimits}
 	switch l := r.(type) {
 	case intLener:
 		dec.lenr = l
 	case int64Lener:
 		dec.len64r = l
+	}
+	if p, ok := ec.(DecodingLimitsProvider); ok {
+		dec.limits = p.DecodingLimits()
 	}
 	return dec
 }
@@ -196,6 +212,9 @@ func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
 		return nil, err
 	}
 	if rem >= 0 || n <= maxPreallocBytes {
+		if err := dec.allocate(int64(n)); err != nil {
+			return nil, err
+		}
 		bs := make([]byte, n)
 		if err := dec.readFull(bs); err != nil {
 			return nil, BadDecodingError
@@ -203,11 +222,18 @@ func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
 		return bs, nil
 	}
 	// the number of unread bytes is unknown, so grow the slice as the bytes arrive.
+	if err := dec.allocate(maxPreallocBytes); err != nil {
+		return nil, err
+	}
 	bs := make([]byte, 0, maxPreallocBytes)
 	for len(bs) < n {
 		if len(bs) == cap(bs) {
 			// at most double the slice, so that it stays proportional to the bytes read.
-			bs = slices.Grow(bs, min(len(bs), n-len(bs)))
+			k := min(len(bs), n-len(bs))
+			if err := dec.allocate(int64(k)); err != nil {
+				return nil, err
+			}
+			bs = slices.Grow(bs, k)
 		}
 		m := min(cap(bs), n)
 		if err := dec.readFull(bs[len(bs):m]); err != nil {
@@ -237,6 +263,69 @@ func (dec *BinaryDecoder) reserve(n int, elemSize uintptr, rem int64) (int, int6
 	return int(c), r
 }
 
+// allocate accounts for n bytes of memory that are about to be allocated for decoded
+// values. It returns BadEncodingLimitsExceeded if the values would take more memory
+// than the decoding limits allow.
+func (dec *BinaryDecoder) allocate(n int64) error {
+	dec.used += n
+	if dec.used <= dec.allowed {
+		return nil
+	}
+	return dec.checkMemory()
+}
+
+// allocateArray accounts for the n bytes of memory that an array takes once decoded,
+// where rem is the number of unread bytes of the input, or -1 if unknown. If the
+// number of unread bytes is unknown, the memory the array may take cannot be known
+// in advance, so its elements are accounted for as they are decoded instead.
+func (dec *BinaryDecoder) allocateArray(n int64, rem int64) error {
+	if rem < 0 {
+		return nil
+	}
+	return dec.allocate(n)
+}
+
+// checkMemory computes the memory the decoded values may take, which grows with the
+// input, and returns BadEncodingLimitsExceeded if they take more.
+func (dec *BinaryDecoder) checkMemory() error {
+	l := dec.limits
+	allowed := int64(math.MaxInt64)
+	if l.MemoryPerInputByte > 0 {
+		input := dec.read
+		if rem := dec.remaining(); rem > 0 {
+			input += min(rem, math.MaxInt64-input)
+		}
+		base := max(l.MinMemory, 0)
+		if input <= (math.MaxInt64-base)/l.MemoryPerInputByte {
+			allowed = base + l.MemoryPerInputByte*input
+		}
+	}
+	if l.MaxMemory > 0 {
+		allowed = min(allowed, l.MaxMemory)
+	}
+	dec.allowed = allowed
+	if dec.used > allowed {
+		dec.limitExceeded = true
+		return BadEncodingLimitsExceeded
+	}
+	return nil
+}
+
+// limitError returns the error with which decoding a value failed, or
+// BadEncodingLimitsExceeded if it failed because a decoding limit was exceeded and
+// the value is not contained in another.
+func (dec *BinaryDecoder) limitError(err error) error {
+	if dec.depth != 0 {
+		return err
+	}
+	exceeded := dec.limitExceeded
+	dec.limitExceeded = false
+	if err != nil && exceeded {
+		return BadEncodingLimitsExceeded
+	}
+	return err
+}
+
 // readArray reads an array of elements that are each encoded in at least minSize bytes.
 func readArray[T any](dec *BinaryDecoder, minSize int64, read func(*BinaryDecoder, *T) error) ([]T, error) {
 	n, err := dec.readLength()
@@ -248,19 +337,34 @@ func readArray[T any](dec *BinaryDecoder, minSize int64, read func(*BinaryDecode
 	}
 	rem, err := dec.checkAvailable(int64(n) * minSize)
 	if err != nil {
-		return nil, err
+		return nil, dec.limitError(err)
 	}
 	var zero T
-	c, reserved := dec.reserve(n, unsafe.Sizeof(zero), rem)
+	size := int64(unsafe.Sizeof(zero))
+	if err := dec.allocateArray(int64(n)*size, rem); err != nil {
+		return nil, dec.limitError(err)
+	}
+	c, reserved := dec.reserve(n, uintptr(size), rem)
 	values := make([]T, 0, c)
 	for i := 0; i < n; i++ {
-		values = append(values, zero)
-		if err := read(dec, &values[i]); err != nil {
-			dec.reserved -= reserved
-			return nil, err
+		if rem < 0 {
+			if err = dec.allocate(size); err != nil {
+				break
+			}
+		}
+		if i == cap(values) {
+			// grow the array as its elements are decoded.
+			values = slices.Grow(values, min(i, n-i))
+		}
+		values = values[:i+1]
+		if err = read(dec, &values[i]); err != nil {
+			break
 		}
 	}
 	dec.reserved -= reserved
+	if err != nil {
+		return nil, dec.limitError(err)
+	}
 	return values, nil
 }
 
@@ -268,6 +372,7 @@ func readArray[T any](dec *BinaryDecoder, minSize int64, read func(*BinaryDecode
 // values. It returns BadEncodingLimitsExceeded if the depth would exceed the limit.
 func (dec *BinaryDecoder) enter() error {
 	if dec.depth >= maxNestingDepth {
+		dec.limitExceeded = true
 		return BadEncodingLimitsExceeded
 	}
 	dec.depth++
@@ -331,7 +436,7 @@ func (dec *BinaryDecoder) Decode(v any) error {
 
 		// if found, call it.
 		if err := f.(decoderFunc)(dec, ptr); err != nil {
-			return err
+			return dec.limitError(err)
 		}
 		return nil
 	}
@@ -344,7 +449,7 @@ func (dec *BinaryDecoder) Decode(v any) error {
 
 	// call the decoder
 	if err := f(dec, ptr); err != nil {
-		return err
+		return dec.limitError(err)
 	}
 	return nil
 }
@@ -456,6 +561,9 @@ func getStructPtrDecoder(typ reflect.Type) (decoderFunc, error) {
 	return func(buf *BinaryDecoder, p unsafe.Pointer) error {
 		p2 := unsafe.Pointer(*(**struct{})(p))
 		if p2 == nilPtr {
+			if err := buf.allocate(int64(typ.Size())); err != nil {
+				return err
+			}
 			v := reflect.New(typ)
 			reflect.NewAt(v.Type(), p).Elem().Set(v)
 			p2 = unsafe.Pointer(*(**struct{})(p))
@@ -499,22 +607,32 @@ func getSliceDecoder(typ reflect.Type) (decoderFunc, error) {
 		if err != nil {
 			return err
 		}
+		if err := buf.allocateArray(int64(n)*int64(elemSize), rem); err != nil {
+			return err
+		}
 		c, reserved := buf.reserve(n, elemSize, rem)
 		s := reflect.MakeSlice(typ, c, c)
 		for i := 0; i < n; i++ {
+			if rem < 0 {
+				if err = buf.allocate(int64(elemSize)); err != nil {
+					break
+				}
+			}
 			if i == c {
 				// grow the slice as elements are decoded.
-				c = min(2*c, n)
+				c += min(c, n-c)
 				s2 := reflect.MakeSlice(typ, c, c)
 				reflect.Copy(s2, s)
 				s = s2
 			}
-			if err := elemDecoder(buf, unsafe.Add(s.UnsafePointer(), uintptr(i)*elemSize)); err != nil {
-				buf.reserved -= reserved
-				return err
+			if err = elemDecoder(buf, unsafe.Add(s.UnsafePointer(), uintptr(i)*elemSize)); err != nil {
+				break
 			}
 		}
 		buf.reserved -= reserved
+		if err != nil {
+			return err
+		}
 		reflect.NewAt(typ, p).Elem().Set(s)
 		return nil
 	}, nil
@@ -746,7 +864,7 @@ func (dec *BinaryDecoder) ReadString(value *string) error {
 	}
 	bs, err := dec.readBytes(n)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	// eliminate alloc of a second byte array and copying from one byte array to another.
 	*value = *(*string)(unsafe.Pointer(&bs))
@@ -803,7 +921,7 @@ func (dec *BinaryDecoder) ReadByteString(value *ByteString) error {
 	}
 	bs, err := dec.readBytes(n)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = *(*ByteString)(unsafe.Pointer(&bs))
 	return nil
@@ -813,7 +931,7 @@ func (dec *BinaryDecoder) ReadByteString(value *ByteString) error {
 func (dec *BinaryDecoder) ReadXMLElement(value *XMLElement) error {
 	var s string
 	if err := dec.ReadString(&s); err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = XMLElement(s)
 	return nil
@@ -838,7 +956,7 @@ func (dec *BinaryDecoder) ReadNodeID(value *NodeID) error {
 			return nil
 		}
 		*value = NewNodeIDNumeric(uint16(0), uint32(id))
-		return nil
+		return dec.allocate(nodeIDNumericSize)
 
 	case 0x01:
 		var ns byte
@@ -850,7 +968,7 @@ func (dec *BinaryDecoder) ReadNodeID(value *NodeID) error {
 			return BadDecodingError
 		}
 		*value = NewNodeIDNumeric(uint16(ns), uint32(id))
-		return nil
+		return dec.allocate(nodeIDNumericSize)
 
 	case 0x02:
 		var ns uint16
@@ -862,7 +980,7 @@ func (dec *BinaryDecoder) ReadNodeID(value *NodeID) error {
 			return BadDecodingError
 		}
 		*value = NewNodeIDNumeric(ns, uint32(id))
-		return nil
+		return dec.allocate(nodeIDNumericSize)
 
 	case 0x03:
 		var ns uint16
@@ -878,7 +996,7 @@ func (dec *BinaryDecoder) ReadNodeID(value *NodeID) error {
 			return nil
 		}
 		*value = NewNodeIDString(ns, id)
-		return nil
+		return dec.allocate(nodeIDStringSize)
 
 	case 0x04:
 		var ns uint16
@@ -894,7 +1012,7 @@ func (dec *BinaryDecoder) ReadNodeID(value *NodeID) error {
 			return nil
 		}
 		*value = NewNodeIDGUID(ns, id)
-		return nil
+		return dec.allocate(nodeIDGUIDSize)
 
 	case 0x05:
 		var ns uint16
@@ -910,7 +1028,7 @@ func (dec *BinaryDecoder) ReadNodeID(value *NodeID) error {
 			return nil
 		}
 		*value = NewNodeIDOpaque(ns, id)
-		return nil
+		return dec.allocate(nodeIDOpaqueSize)
 
 	default:
 		return BadDecodingError
@@ -1009,7 +1127,30 @@ func (dec *BinaryDecoder) ReadExpandedNodeID(value *ExpandedNodeID) error {
 		}
 	}
 	*value = ExpandedNodeID{svr, nsu, n}
-	return nil
+	return dec.allocate(nodeIDSize(n))
+}
+
+// sizes of the values that NodeIDs hold.
+const (
+	nodeIDNumericSize = int64(unsafe.Sizeof(NodeIDNumeric{}))
+	nodeIDStringSize  = int64(unsafe.Sizeof(NodeIDString{}))
+	nodeIDGUIDSize    = int64(unsafe.Sizeof(NodeIDGUID{}))
+	nodeIDOpaqueSize  = int64(unsafe.Sizeof(NodeIDOpaque{}))
+)
+
+// nodeIDSize returns the size of the value that a NodeID holds.
+func nodeIDSize(n NodeID) int64 {
+	switch n.(type) {
+	case NodeIDNumeric:
+		return nodeIDNumericSize
+	case NodeIDString:
+		return nodeIDStringSize
+	case NodeIDGUID:
+		return nodeIDGUIDSize
+	case NodeIDOpaque:
+		return nodeIDOpaqueSize
+	}
+	return 0
 }
 
 // ReadStatusCode reads a StatusCode.
@@ -1069,7 +1210,7 @@ func (dec *BinaryDecoder) ReadExtensionObject(value *ExtensionObject) error {
 	}
 	err := dec.readExtensionObject(value)
 	dec.leave()
-	return err
+	return dec.limitError(err)
 }
 
 func (dec *BinaryDecoder) readExtensionObject(value *ExtensionObject) error {
@@ -1098,6 +1239,10 @@ func (dec *BinaryDecoder) readExtensionObject(value *ExtensionObject) error {
 			}
 			if _, err := dec.checkAvailable(int64(length)); err != nil {
 				return BadDecodingError
+			}
+			// the object is held on the heap.
+			if err := dec.allocate(int64(typ.Size())); err != nil {
+				return err
 			}
 			// decode the body within its length.
 			outerR, outerLimit := dec.r, dec.limit
@@ -1141,7 +1286,7 @@ func (dec *BinaryDecoder) ReadDataValue(value *DataValue) error {
 	}
 	err := dec.readDataValue(value)
 	dec.leave()
-	return err
+	return dec.limitError(err)
 }
 
 func (dec *BinaryDecoder) readDataValue(value *DataValue) error {
@@ -1207,13 +1352,24 @@ func (dec *BinaryDecoder) ReadVariant(value *Variant) error {
 	}
 	err := dec.readVariant(value)
 	dec.leave()
-	return err
+	return dec.limitError(err)
 }
 
 func (dec *BinaryDecoder) readVariant(value *Variant) error {
 	var b byte
 	if err := dec.ReadByte(&b); err != nil {
 		return BadDecodingError
+	}
+	// a Variant holds its value on the heap.
+	size := sliceHeaderSize
+	if b&VariantTypeArray == 0 {
+		size = 0
+		if t := int(b & 0x3F); t < len(variantValueSizes) {
+			size = variantValueSizes[t]
+		}
+	}
+	if err := dec.allocate(size); err != nil {
+		return err
 	}
 
 	// If scalar value
@@ -1700,6 +1856,37 @@ func (dec *BinaryDecoder) readVariant(value *Variant) error {
 	}
 }
 
+// sliceHeaderSize is the size of a slice.
+const sliceHeaderSize = int64(unsafe.Sizeof([]byte(nil)))
+
+// variantValueSizes are the sizes of the scalar values of each type that a Variant
+// holds. NodeIDs and ExtensionObjects are accounted for when they are decoded.
+var variantValueSizes = [...]int64{
+	VariantTypeBoolean:        int64(unsafe.Sizeof(false)),
+	VariantTypeSByte:          1,
+	VariantTypeByte:           1,
+	VariantTypeInt16:          2,
+	VariantTypeUInt16:         2,
+	VariantTypeInt32:          4,
+	VariantTypeUInt32:         4,
+	VariantTypeInt64:          8,
+	VariantTypeUInt64:         8,
+	VariantTypeFloat:          4,
+	VariantTypeDouble:         8,
+	VariantTypeString:         int64(unsafe.Sizeof("")),
+	VariantTypeDateTime:       int64(unsafe.Sizeof(time.Time{})),
+	VariantTypeGUID:           int64(unsafe.Sizeof(uuid.UUID{})),
+	VariantTypeByteString:     int64(unsafe.Sizeof(ByteString(""))),
+	VariantTypeXMLElement:     int64(unsafe.Sizeof(XMLElement(""))),
+	VariantTypeNodeID:         0,
+	VariantTypeExpandedNodeID: int64(unsafe.Sizeof(ExpandedNodeID{})),
+	VariantTypeStatusCode:     int64(unsafe.Sizeof(StatusCode(0))),
+	VariantTypeQualifiedName:  int64(unsafe.Sizeof(QualifiedName{})),
+	VariantTypeLocalizedText:  int64(unsafe.Sizeof(LocalizedText{})),
+	VariantTypeDataValue:      int64(unsafe.Sizeof(DataValue{})),
+	VariantTypeDiagnosticInfo: int64(unsafe.Sizeof(DiagnosticInfo{})),
+}
+
 // readMatrix reads the values and ArrayDimensions of a multi-dimensional array of
 // two or three dimensions, and stores the array in value as nested slices. Once
 // both have been read, it returns BadDataTypeIDUnknown if they do not describe
@@ -1714,6 +1901,14 @@ func readMatrix[T any](dec *BinaryDecoder, value *Variant, readValues func(*Bina
 		return BadDecodingError
 	}
 	if err := checkArrayDimensions(dims, len(vals)); err != nil {
+		return err
+	}
+	// the slices that hold the elements.
+	headers := int64(dims[0])
+	if len(dims) == 3 {
+		headers += int64(dims[0]) * int64(dims[1])
+	}
+	if err := dec.allocate(headers * sliceHeaderSize); err != nil {
 		return err
 	}
 	if len(dims) == 2 {
@@ -1803,7 +1998,7 @@ func (dec *BinaryDecoder) ReadDiagnosticInfo(value *DiagnosticInfo) error {
 	}
 	err := dec.readDiagnosticInfo(value)
 	dec.leave()
-	return err
+	return dec.limitError(err)
 }
 
 func (dec *BinaryDecoder) readDiagnosticInfo(value *DiagnosticInfo) error {
@@ -1813,42 +2008,63 @@ func (dec *BinaryDecoder) readDiagnosticInfo(value *DiagnosticInfo) error {
 		return BadDecodingError
 	}
 	if (b & 1) != 0 {
+		if err := dec.allocate(int64(unsafe.Sizeof(int32(0)))); err != nil {
+			return err
+		}
 		result.SymbolicID = new(int32)
 		if err := dec.ReadInt32(result.SymbolicID); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 2) != 0 {
+		if err := dec.allocate(int64(unsafe.Sizeof(int32(0)))); err != nil {
+			return err
+		}
 		result.NamespaceURI = new(int32)
 		if err := dec.ReadInt32(result.NamespaceURI); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 8) != 0 {
+		if err := dec.allocate(int64(unsafe.Sizeof(int32(0)))); err != nil {
+			return err
+		}
 		result.Locale = new(int32)
 		if err := dec.ReadInt32(result.Locale); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 4) != 0 {
+		if err := dec.allocate(int64(unsafe.Sizeof(int32(0)))); err != nil {
+			return err
+		}
 		result.LocalizedText = new(int32)
 		if err := dec.ReadInt32(result.LocalizedText); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 16) != 0 {
+		if err := dec.allocate(int64(unsafe.Sizeof(""))); err != nil {
+			return err
+		}
 		result.AdditionalInfo = new(string)
 		if err := dec.ReadString(result.AdditionalInfo); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 32) != 0 {
+		if err := dec.allocate(int64(unsafe.Sizeof(StatusCode(0)))); err != nil {
+			return err
+		}
 		result.InnerStatusCode = new(StatusCode)
 		if err := dec.ReadStatusCode(result.InnerStatusCode); err != nil {
 			return BadDecodingError
 		}
 	}
 	if (b & 64) != 0 {
+		if err := dec.allocate(int64(unsafe.Sizeof(DiagnosticInfo{}))); err != nil {
+			return err
+		}
 		result.InnerDiagnosticInfo = new(DiagnosticInfo)
 		if err := dec.ReadDiagnosticInfo(result.InnerDiagnosticInfo); err != nil {
 			return err
@@ -1980,7 +2196,7 @@ func (dec *BinaryDecoder) ReadDoubleArray(value *[]float64) error {
 func (dec *BinaryDecoder) ReadStringArray(value *[]string) error {
 	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadString)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -1990,7 +2206,7 @@ func (dec *BinaryDecoder) ReadStringArray(value *[]string) error {
 func (dec *BinaryDecoder) ReadDateTimeArray(value *[]time.Time) error {
 	temp, err := readArray(dec, 8, (*BinaryDecoder).ReadDateTime)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2000,7 +2216,7 @@ func (dec *BinaryDecoder) ReadDateTimeArray(value *[]time.Time) error {
 func (dec *BinaryDecoder) ReadGUIDArray(value *[]uuid.UUID) error {
 	temp, err := readArray(dec, 16, (*BinaryDecoder).ReadGUID)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2010,7 +2226,7 @@ func (dec *BinaryDecoder) ReadGUIDArray(value *[]uuid.UUID) error {
 func (dec *BinaryDecoder) ReadByteStringArray(value *[]ByteString) error {
 	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadByteString)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2020,7 +2236,7 @@ func (dec *BinaryDecoder) ReadByteStringArray(value *[]ByteString) error {
 func (dec *BinaryDecoder) ReadXMLElementArray(value *[]XMLElement) error {
 	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadXMLElement)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2030,7 +2246,7 @@ func (dec *BinaryDecoder) ReadXMLElementArray(value *[]XMLElement) error {
 func (dec *BinaryDecoder) ReadNodeIDArray(value *[]NodeID) error {
 	temp, err := readArray(dec, 2, (*BinaryDecoder).ReadNodeID)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2040,7 +2256,7 @@ func (dec *BinaryDecoder) ReadNodeIDArray(value *[]NodeID) error {
 func (dec *BinaryDecoder) ReadExpandedNodeIDArray(value *[]ExpandedNodeID) error {
 	temp, err := readArray(dec, 2, (*BinaryDecoder).ReadExpandedNodeID)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2050,7 +2266,7 @@ func (dec *BinaryDecoder) ReadExpandedNodeIDArray(value *[]ExpandedNodeID) error
 func (dec *BinaryDecoder) ReadStatusCodeArray(value *[]StatusCode) error {
 	temp, err := readArray(dec, 4, (*BinaryDecoder).ReadStatusCode)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2060,7 +2276,7 @@ func (dec *BinaryDecoder) ReadStatusCodeArray(value *[]StatusCode) error {
 func (dec *BinaryDecoder) ReadQualifiedNameArray(value *[]QualifiedName) error {
 	temp, err := readArray(dec, 6, (*BinaryDecoder).ReadQualifiedName)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2070,7 +2286,7 @@ func (dec *BinaryDecoder) ReadQualifiedNameArray(value *[]QualifiedName) error {
 func (dec *BinaryDecoder) ReadLocalizedTextArray(value *[]LocalizedText) error {
 	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadLocalizedText)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2080,7 +2296,7 @@ func (dec *BinaryDecoder) ReadLocalizedTextArray(value *[]LocalizedText) error {
 func (dec *BinaryDecoder) ReadExtensionObjectArray(value *[]ExtensionObject) error {
 	temp, err := readArray(dec, 3, (*BinaryDecoder).ReadExtensionObject)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2090,7 +2306,7 @@ func (dec *BinaryDecoder) ReadExtensionObjectArray(value *[]ExtensionObject) err
 func (dec *BinaryDecoder) ReadDataValueArray(value *[]DataValue) error {
 	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadDataValue)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2100,7 +2316,7 @@ func (dec *BinaryDecoder) ReadDataValueArray(value *[]DataValue) error {
 func (dec *BinaryDecoder) ReadVariantArray(value *[]Variant) error {
 	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadVariant)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
@@ -2110,7 +2326,7 @@ func (dec *BinaryDecoder) ReadVariantArray(value *[]Variant) error {
 func (dec *BinaryDecoder) ReadDiagnosticInfoArray(value *[]DiagnosticInfo) error {
 	temp, err := readArray(dec, 1, (*BinaryDecoder).ReadDiagnosticInfo)
 	if err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = temp
 	return nil
