@@ -946,6 +946,11 @@ func (srv *Server) initializeNamespace() error {
 }
 
 func (srv *Server) buildEndpointDescriptions() []ua.EndpointDescription {
+	// only advertise the security policies that the key of the server supports.
+	keyLength := 0
+	if srv.localPrivateKey != nil {
+		keyLength = srv.localPrivateKey.N.BitLen()
+	}
 	eds := []ua.EndpointDescription{}
 	if srv.allowSecurityPolicyNone {
 		toks := []ua.UserTokenPolicy{}
@@ -957,11 +962,16 @@ func (srv *Server) buildEndpointDescriptions() []ua.EndpointDescription {
 			})
 		}
 		if srv.userNameIdentityAuthenticator != nil {
-			toks = append(toks, ua.UserTokenPolicy{
-				PolicyID:          fmt.Sprintf("%s_%d", ua.UserTokenTypeUserName, len(eds)),
-				TokenType:         ua.UserTokenTypeUserName,
-				SecurityPolicyURI: ua.SecurityPolicyURIBasic256Sha256,
-			})
+			// passwords are encrypted with the strongest security policy that the key of the server supports.
+			if uri := strongestPasswordSecurityPolicyURI(keyLength); uri != "" {
+				toks = append(toks, ua.UserTokenPolicy{
+					PolicyID:          fmt.Sprintf("%s_%d", ua.UserTokenTypeUserName, len(eds)),
+					TokenType:         ua.UserTokenTypeUserName,
+					SecurityPolicyURI: uri,
+				})
+			} else {
+				log.Printf("Warning: RSA key length of %d bits does not support encrypting passwords. Skipping user name identity on security policy None.\n", keyLength)
+			}
 		}
 		if srv.x509IdentityAuthenticator != nil {
 			toks = append(toks, ua.UserTokenPolicy{
@@ -989,6 +999,15 @@ func (srv *Server) buildEndpointDescriptions() []ua.EndpointDescription {
 		ua.SecurityPolicyURIAes128Sha256RsaOaep,
 		ua.SecurityPolicyURIAes256Sha256RsaPss,
 	}
+	supported := make([]string, 0, len(uris))
+	for _, uri := range uris {
+		if rsaKeyLengthSupported(uri, keyLength) {
+			supported = append(supported, uri)
+		} else {
+			log.Printf("Warning: RSA key length of %d bits is not supported by security policy %s. Skipping security policy.\n", keyLength, uri)
+		}
+	}
+	uris = supported
 	for _, uri := range uris {
 		toks := []ua.UserTokenPolicy{}
 		if srv.anonymousIdentityAuthenticator != nil {
@@ -1058,6 +1077,32 @@ func (srv *Server) buildEndpointDescriptions() []ua.EndpointDescription {
 		})
 	}
 	return eds
+}
+
+// maxRSAKeyLength is the maximum length in bits of RSA keys.
+const maxRSAKeyLength = 4096
+
+// rsaKeyLengthSupported returns true if an RSA key with the given length in bits meets the asymmetric key length
+// of the security policy (OPC UA Part 7): at least 1024 bits for Basic128Rsa15 and Basic256, at least 2048 bits
+// for Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, and at most 4096 bits.
+func rsaKeyLengthSupported(securityPolicyURI string, keyLength int) bool {
+	minKeyLength := 2048
+	switch securityPolicyURI {
+	case ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256:
+		minKeyLength = 1024
+	}
+	return keyLength >= minKeyLength && keyLength <= maxRSAKeyLength
+}
+
+// strongestPasswordSecurityPolicyURI returns the strongest security policy that encrypts passwords with RSA-OAEP
+// using an RSA key with the given length in bits, or an empty string if there is none.
+func strongestPasswordSecurityPolicyURI(keyLength int) string {
+	for _, uri := range []string{ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIBasic256} {
+		if rsaKeyLengthSupported(uri, keyLength) {
+			return uri
+		}
+	}
+	return ""
 }
 
 // passwordSecurityPolicyURI returns the security policy that encrypts passwords on endpoints with the given

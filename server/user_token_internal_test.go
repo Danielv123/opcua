@@ -131,5 +131,46 @@ func TestPasswordSecurityPolicyURI(t *testing.T) {
 		if policy != ua.SecurityPolicyURIBasic128Rsa15 && got != policy {
 			t.Errorf("%s: got %s", policy, got)
 		}
+		// a key that supports the policy of the endpoint supports the policy of the password.
+		for _, keyLength := range []int{1024, 2048, 3072, 4096} {
+			if rsaKeyLengthSupported(policy, keyLength) && !rsaKeyLengthSupported(got, keyLength) {
+				t.Errorf("%s: %d bit key does not support password policy %s", policy, keyLength, got)
+			}
+		}
+	}
+}
+
+// TestRSAKeyLengthSupported tests the key lengths of the security policies.
+func TestRSAKeyLengthSupported(t *testing.T) {
+	legacy := []string{ua.SecurityPolicyURIBasic128Rsa15, ua.SecurityPolicyURIBasic256}
+	current := []string{ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep, ua.SecurityPolicyURIAes256Sha256RsaPss}
+	for _, c := range []struct {
+		keyLength       int
+		legacy, current bool
+		password        string
+	}{
+		{0, false, false, ""},
+		{512, false, false, ""},
+		{1023, false, false, ""},
+		{1024, true, false, ua.SecurityPolicyURIBasic256},
+		{2047, true, false, ua.SecurityPolicyURIBasic256},
+		{2048, true, true, ua.SecurityPolicyURIBasic256Sha256},
+		{4096, true, true, ua.SecurityPolicyURIBasic256Sha256},
+		{4097, false, false, ""},
+		{8192, false, false, ""},
+	} {
+		for _, policy := range legacy {
+			if got := rsaKeyLengthSupported(policy, c.keyLength); got != c.legacy {
+				t.Errorf("%s, %d bits: got %t, want %t", policy, c.keyLength, got, c.legacy)
+			}
+		}
+		for _, policy := range current {
+			if got := rsaKeyLengthSupported(policy, c.keyLength); got != c.current {
+				t.Errorf("%s, %d bits: got %t, want %t", policy, c.keyLength, got, c.current)
+			}
+		}
+		if got := strongestPasswordSecurityPolicyURI(c.keyLength); got != c.password {
+			t.Errorf("password policy, %d bits: got %q, want %q", c.keyLength, got, c.password)
+		}
 	}
 }
