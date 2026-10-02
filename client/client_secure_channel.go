@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/awcullen/opcua/internal/securechannel"
 	"github.com/awcullen/opcua/ua"
 	"github.com/djherbis/buffer"
 )
@@ -109,6 +110,7 @@ type clientSecureChannel struct {
 	closing                    bool
 	requestHandle              uint32
 	sequenceNumber             uint32
+	remoteSequenceNumber       securechannel.SequenceNumberValidator
 	sendingTokenID             uint32
 	receivingTokenID           uint32
 	localSigningKey            []byte
@@ -187,7 +189,8 @@ func newClientSecureChannel(
 		trace:                                trace,
 	}
 	if certs, err := x509.ParseCertificates(ch.remoteCertificate); err == nil && len(certs) > 0 {
-		ch.remotePublicKey = certs[0].PublicKey.(*rsa.PublicKey)
+		// the key remains nil if the certificate does not hold an RSA key allowed by the security policy.
+		ch.remotePublicKey, _ = securechannel.RSAPublicKey(certs[0], securityPolicyURI)
 		ch.remoteThumbprint = sha1.Sum(certs[0].Raw)
 	}
 	return ch
@@ -280,6 +283,16 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		certs, err := x509.ParseCertificates(ch.remoteCertificate)
 		if err != nil || len(certs) == 0 {
 			return ua.BadSecurityChecksFailed
+		}
+		// bound the cost of the signature checks of the validation of the chain sent by the server, and
+		// reject a server key that the security policy does not allow before the key is used.
+		if err := securechannel.CheckCertificateChain(certs); err != nil {
+			return err
+		}
+		if ch.securityPolicyURI != ua.SecurityPolicyURINone {
+			if _, err := securechannel.RSAPublicKey(certs[0], ch.securityPolicyURI); err != nil {
+				return err
+			}
 		}
 		err = ua.ValidateCertificate(
 			certs,
@@ -426,11 +439,20 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		if ch.localPrivateKey == nil {
 			return ua.BadSecurityChecksFailed
 		}
+		// the security policy must allow the length of the key of the client certificate.
+		if err := securechannel.CheckRSAKey(&ch.localPrivateKey.PublicKey, ch.securityPolicyURI); err != nil {
+			return err
+		}
 		ch.localPrivateKeySize = ch.localPrivateKey.Size()
 		if ch.remotePublicKey == nil {
 			return ua.BadSecurityChecksFailed
 		}
 		ch.remotePublicKeySize = ch.remotePublicKey.Size()
+	default:
+		// the session would need the server's RSA key for any security policy but None.
+		if ch.securityPolicyURI != ua.SecurityPolicyURINone {
+			return ua.BadSecurityModeRejected
+		}
 	}
 
 	ch.pendingResponseCh = make(chan *ua.ServiceOperation, 32)
@@ -440,6 +462,7 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 	ch.tokenID = 0
 	ch.sendingTokenID = 0
 	ch.receivingTokenID = 0
+	ch.remoteSequenceNumber = securechannel.SequenceNumberValidator{}
 
 	go ch.responseWorker()
 
@@ -454,7 +477,10 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	response := res.(*ua.OpenSecureChannelResponse)
+	response, ok := res.(*ua.OpenSecureChannelResponse)
+	if !ok {
+		return ua.BadUnknownResponse
+	}
 	if response.ServerProtocolVersion < protocolVersion {
 		return ua.BadProtocolVersionUnsupported
 	}
@@ -475,7 +501,9 @@ func (ch *clientSecureChannel) Close(ctx context.Context) error {
 	defer ch.Unlock()
 	ch.closing = true
 	_, err := ch.Request(ctx, &ua.CloseSecureChannelRequest{})
-	if err != nil {
+	// the server closes the connection when it receives the request, which may be noticed before
+	// the response to the request is.
+	if err != nil && err != ua.BadSecureChannelClosed {
 		return err
 	}
 	if ch.conn != nil {
@@ -1371,9 +1399,9 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 	var res ua.ServiceResponse
 	var paddingHeaderSize int
 	var plainHeaderSize int
-	var bodySize int
-	var paddingSize int
-	signatureSize := ch.securityPolicy.SymSignatureSize()
+	var signatureSize int
+	var bodyStart, bodyEnd int
+	var id uint32
 
 	var bodyStream = buffer.NewPartitionAt(ch.bufferPool)
 	defer bodyStream.Reset()
@@ -1414,8 +1442,13 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 			return nil, ua.BadDecodingError
 		}
 
+		// a message that was split into chunks continues with MSG chunks.
+		if chunkCount > 1 && messageType == ua.MessageTypeOpenFinal {
+			return nil, ua.BadTCPMessageTypeInvalid
+		}
+
 		switch messageType {
-		case ua.MessageTypeChunk, ua.MessageTypeFinal:
+		case ua.MessageTypeChunk, ua.MessageTypeFinal, ua.MessageTypeAbort:
 			// header
 			var channelID uint32
 			if err := decoder.ReadUInt32(&channelID); err != nil {
@@ -1429,6 +1462,12 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 			var tokenID uint32
 			if err := decoder.ReadUInt32(&tokenID); err != nil {
 				return nil, ua.BadDecodingError
+			}
+
+			// token ids are never zero. Without this check, a chunk with token id zero would be
+			// accepted before the keys of the first token are installed.
+			if tokenID == 0 {
+				return nil, ua.BadSecureChannelTokenUnknown
 			}
 
 			// detect new token
@@ -1454,6 +1493,21 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 			ch.tokenLock.RUnlock()
 
 			plainHeaderSize = 16
+			signatureSize, paddingHeaderSize = 0, 0
+			switch ch.securityMode {
+			case ua.MessageSecurityModeSignAndEncrypt:
+				paddingHeaderSize = securechannel.PaddingHeaderSize(ch.securityPolicy.SymEncryptionBlockSize())
+				signatureSize = ch.securityPolicy.SymSignatureSize()
+			case ua.MessageSecurityModeSign:
+				signatureSize = ch.securityPolicy.SymSignatureSize()
+			}
+			// check the chunk holds the sequence header, padding header and signature before slicing it.
+			bodyStart = plainHeaderSize + sequenceHeaderSize
+			sigStart, err := securechannel.SignatureStart(count, bodyStart, paddingHeaderSize, signatureSize)
+			if err != nil {
+				return nil, ua.BadDecodingError
+			}
+
 			// decrypt
 			if ch.securityMode == ua.MessageSecurityModeSignAndEncrypt {
 				span := receiveBuffer[plainHeaderSize:count]
@@ -1466,7 +1520,6 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 			// verify
 			switch ch.securityMode {
 			case ua.MessageSecurityModeSignAndEncrypt, ua.MessageSecurityModeSign:
-				sigStart := count - signatureSize
 				ch.symVerifyHMAC.Reset()
 				ch.symVerifyHMAC.Write(receiveBuffer[:sigStart])
 				sig := ch.symVerifyHMAC.Sum(nil)
@@ -1475,39 +1528,9 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 				}
 			}
 
-			// read sequence header
-			var unused uint32
-			if err = decoder.ReadUInt32(&unused); err != nil {
+			// body, after checking the padding of the verified chunk.
+			if bodyEnd, err = securechannel.BodyEnd(receiveBuffer[:sigStart], bodyStart, paddingHeaderSize); err != nil {
 				return nil, ua.BadDecodingError
-			}
-
-			if err = decoder.ReadUInt32(&unused); err != nil {
-				return nil, ua.BadDecodingError
-			}
-
-			// body
-			switch ch.securityMode {
-			case ua.MessageSecurityModeSignAndEncrypt:
-				if ch.securityPolicy.SymEncryptionBlockSize() > 256 {
-					paddingHeaderSize = 2
-					start := int(messageLength) - signatureSize - paddingHeaderSize
-					paddingSize = int(binary.LittleEndian.Uint16(receiveBuffer[start : start+2]))
-				} else {
-					paddingHeaderSize = 1
-					start := int(messageLength) - signatureSize - paddingHeaderSize
-					paddingSize = int(receiveBuffer[start])
-				}
-				bodySize = int(messageLength) - plainHeaderSize - sequenceHeaderSize - paddingSize - paddingHeaderSize - signatureSize
-
-			default:
-				bodySize = int(messageLength) - plainHeaderSize - sequenceHeaderSize - signatureSize
-			}
-
-			m := plainHeaderSize + sequenceHeaderSize
-			n := m + bodySize
-			_, err = bodyStream.Write(receiveBuffer[m:n])
-			if err != nil {
-				return nil, ua.BadTCPInternalError
 			}
 
 			isFinal = messageType == ua.MessageTypeFinal
@@ -1532,75 +1555,60 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 			}
 			plainHeaderSize = count - stream.Len()
 
-			// decrypt
+			bodyStart = plainHeaderSize + sequenceHeaderSize
 			switch ch.securityMode {
 			case ua.MessageSecurityModeSignAndEncrypt, ua.MessageSecurityModeSign:
+				// the cipher text consists of whole blocks, each of which decrypts to a whole plain text
+				// block, so the chunk is shorter after decryption. Check that it holds the sequence header,
+				// padding header and signature before decrypting and slicing it.
 				cipherTextBlockSize := ch.localPrivateKeySize
-				cipherText := make([]byte, cipherTextBlockSize)
-				jj := plainHeaderSize
-				for ii := plainHeaderSize; ii < int(messageLength); ii += cipherTextBlockSize {
-					copy(cipherText, receiveBuffer[ii:])
-					// decrypt with local private key.
-					plainText, err := ch.securityPolicy.RSADecrypt(ch.localPrivateKey, cipherText)
-					if err != nil {
-						return nil, ua.BadDecodingError
-					}
-					jj += copy(receiveBuffer[jj:], plainText)
+				plainTextBlockSize := cipherTextBlockSize - ch.securityPolicy.RSAPaddingSize()
+				if (count-plainHeaderSize)%cipherTextBlockSize != 0 {
+					return nil, ua.BadDecodingError
 				}
-				// msg is shorter after decryption
-				messageLength = uint32(jj)
-			}
-
-			// verify
-			switch ch.securityMode {
-			case ua.MessageSecurityModeSignAndEncrypt, ua.MessageSecurityModeSign:
-				// verify with remote public key.
-				sigEnd := int(messageLength)
-				sigStart := sigEnd - ch.remotePublicKeySize
-				err := ch.securityPolicy.RSAVerify(ch.remotePublicKey, receiveBuffer[:sigStart], receiveBuffer[sigStart:sigEnd])
+				plainTextEnd := plainHeaderSize + (count-plainHeaderSize)/cipherTextBlockSize*plainTextBlockSize
+				signatureSize = ch.remotePublicKeySize
+				paddingHeaderSize = securechannel.PaddingHeaderSize(cipherTextBlockSize)
+				sigStart, err := securechannel.SignatureStart(plainTextEnd, bodyStart, paddingHeaderSize, signatureSize)
 				if err != nil {
 					return nil, ua.BadDecodingError
 				}
-			}
 
-			// sequence header
-			var unused uint32
-			if err = decoder.ReadUInt32(&unused); err != nil {
-				return nil, ua.BadDecodingError
-			}
-			if err = decoder.ReadUInt32(&unused); err != nil {
-				return nil, ua.BadDecodingError
-			}
-
-			// body
-			switch ch.securityMode {
-			case ua.MessageSecurityModeSignAndEncrypt, ua.MessageSecurityModeSign:
-				cipherTextBlockSize := ch.localPrivateKeySize
-				signatureSize := ch.remotePublicKeySize
-				if cipherTextBlockSize > 256 {
-					paddingHeaderSize = 2
-					start := int(messageLength) - signatureSize - paddingHeaderSize
-					paddingSize = int(binary.LittleEndian.Uint16(receiveBuffer[start : start+2]))
-				} else {
-					paddingHeaderSize = 1
-					start := int(messageLength) - signatureSize - paddingHeaderSize
-					paddingSize = int(receiveBuffer[start])
+				// decrypt with local private key. All blocks are decrypted and the signature is verified
+				// even if a block fails to decrypt (see DecryptBlock), and decryption and verification
+				// failures are reported alike, so the result does not reveal whether a block was correctly padded.
+				decrypted := true
+				cipherText := make([]byte, cipherTextBlockSize)
+				plainText := make([]byte, plainTextBlockSize)
+				jj := plainHeaderSize
+				for ii := plainHeaderSize; ii < count; ii += cipherTextBlockSize {
+					copy(cipherText, receiveBuffer[ii:ii+cipherTextBlockSize])
+					ok := securechannel.DecryptBlock(ch.securityPolicy, ch.localPrivateKey, cipherText, plainText)
+					decrypted = decrypted && ok
+					jj += copy(receiveBuffer[jj:], plainText)
 				}
-				bodySize = int(messageLength) - plainHeaderSize - sequenceHeaderSize - paddingSize - paddingHeaderSize - signatureSize
+
+				// verify with remote public key.
+				err = ch.securityPolicy.RSAVerify(ch.remotePublicKey, receiveBuffer[:sigStart], receiveBuffer[sigStart:plainTextEnd])
+				if err != nil || !decrypted {
+					return nil, ua.BadSecurityChecksFailed
+				}
+
+				// body, after checking the padding of the verified chunk.
+				if bodyEnd, err = securechannel.BodyEnd(receiveBuffer[:sigStart], bodyStart, paddingHeaderSize); err != nil {
+					return nil, ua.BadDecodingError
+				}
 
 			default:
-				bodySize = int(messageLength) - plainHeaderSize - sequenceHeaderSize // - ch.asymRemoteSignatureSize
-			}
-
-			m := plainHeaderSize + sequenceHeaderSize
-			n := m + bodySize
-			if _, err := bodyStream.Write(receiveBuffer[m:n]); err != nil {
-				return nil, ua.BadTCPInternalError
+				if _, err := securechannel.SignatureStart(count, bodyStart, 0, 0); err != nil {
+					return nil, ua.BadDecodingError
+				}
+				bodyEnd = count
 			}
 
 			isFinal = messageType == ua.MessageTypeOpenFinal
 
-		case ua.MessageTypeError, ua.MessageTypeAbort:
+		case ua.MessageTypeError:
 			var statusCode uint32
 			if err := decoder.ReadUInt32(&statusCode); err != nil {
 				return nil, ua.BadDecodingError
@@ -1613,6 +1621,48 @@ func (ch *clientSecureChannel) readResponse() (ua.ServiceResponse, ua.StatusCode
 
 		default:
 			return nil, ua.BadUnknownResponse
+		}
+
+		// sequence header, of the verified chunk.
+		var sequenceNumber, requestID uint32
+		if err := decoder.ReadUInt32(&sequenceNumber); err != nil {
+			return nil, ua.BadDecodingError
+		}
+		if err := decoder.ReadUInt32(&requestID); err != nil {
+			return nil, ua.BadDecodingError
+		}
+		// reject replayed, reordered or missing chunks. The sequence numbers are shared by all
+		// messages of the channel, and only checked once the chunk has been verified.
+		if err := ch.remoteSequenceNumber.Validate(sequenceNumber); err != nil {
+			return nil, ua.BadSequenceNumberInvalid
+		}
+		// all chunks of a message have the same request id.
+		if chunkCount > 1 && requestID != id {
+			return nil, ua.BadDecodingError
+		}
+		id = requestID
+
+		// the server aborted the response: discard its chunks and fail the request with the given error.
+		if messageType == ua.MessageTypeAbort {
+			abortDecoder := ua.NewBinaryDecoder(bytes.NewReader(receiveBuffer[bodyStart:bodyEnd]), ch)
+			var statusCode uint32
+			if err := abortDecoder.ReadUInt32(&statusCode); err != nil {
+				return nil, ua.BadDecodingError
+			}
+			var reason string
+			if err := abortDecoder.ReadString(&reason); err != nil {
+				return nil, ua.BadDecodingError
+			}
+			result := ua.StatusCode(statusCode)
+			if !result.IsBad() {
+				result = ua.BadUnexpectedError
+			}
+			// the client uses the request handle as request id.
+			return &ua.ServiceFault{ResponseHeader: ua.ResponseHeader{Timestamp: time.Now(), RequestHandle: requestID, ServiceResult: result}}, ua.Good
+		}
+
+		if _, err := bodyStream.Write(receiveBuffer[bodyStart:bodyEnd]); err != nil {
+			return nil, ua.BadTCPInternalError
 		}
 
 		if i := int64(ch.maxResponseMessageSize); i > 0 && bodyStream.Len() > i {
@@ -1771,7 +1821,10 @@ func (ch *clientSecureChannel) renewToken(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	response := res.(*ua.OpenSecureChannelResponse)
+	response, ok := res.(*ua.OpenSecureChannelResponse)
+	if !ok {
+		return ua.BadUnknownResponse
+	}
 	if response.ServerProtocolVersion < protocolVersion {
 		return ua.BadProtocolVersionUnsupported
 	}
