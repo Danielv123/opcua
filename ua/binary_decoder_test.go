@@ -345,7 +345,14 @@ func TestDecodeNestedArrayPreallocationIsProportional(t *testing.T) {
 			t.Fatalf("%s: expected an error", kind)
 		}
 		runtime.ReadMemStats(&after)
-		if a := after.TotalAlloc - before.TotalAlloc; a > 4*uint64(len(input))+128*1024 {
+		limit := 4*uint64(len(input)) + 128*1024
+		if kind == "opaque" {
+			// if the length of the input is unknown, the arrays are limited by the
+			// decoding limits only.
+			l := ua.DefaultDecodingLimits
+			limit = uint64(l.MinMemory+l.MemoryPerInputByte*int64(len(input))) + 128*1024
+		}
+		if a := after.TotalAlloc - before.TotalAlloc; a > limit {
 			t.Fatalf("%s: decoder allocated %d bytes for a %d byte input", kind, a, len(input))
 		}
 	}

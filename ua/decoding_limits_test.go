@@ -11,6 +11,7 @@ import (
 
 	"github.com/awcullen/opcua/ua"
 	"github.com/djherbis/buffer"
+	"gotest.tools/assert"
 )
 
 // historyUpdateRequest returns a HistoryUpdateRequest that updates a node with n
@@ -68,7 +69,7 @@ func TestDecodeMemoryLimitRejectsAmplification(t *testing.T) {
 		// for the input read so far.
 		limit := uint64(1 << 20)
 		if kind == "opaque" {
-			limit = 32 << 20
+			limit = 8 << 20
 		}
 		if allocated > limit {
 			t.Fatalf("%s: decoder allocated %d bytes", kind, allocated)
@@ -198,6 +199,82 @@ func TestDecodeMemoryLimitIsStrict(t *testing.T) {
 			t.Fatalf("%s: decoder allocated %d bytes", kind, allocated)
 		}
 	}
+}
+
+func TestDecodeMemoryLimitPerInputByteOnly(t *testing.T) {
+	// with no minimum, values that take no more memory than their encoding decode
+	// from any reader, even if the length of the input is unknown.
+	ec := limitsContext{ua.DecodingLimits{MaxMemory: 1 << 20, MemoryPerInputByte: 1}}
+	long := bytes.Repeat([]byte("0123456789"), 10_000)
+	cases := map[string]struct {
+		input  []byte
+		decode func(*ua.BinaryDecoder) (any, error)
+		want   any
+	}{
+		"short String": {cat(le32(5), []byte("hello")), func(dec *ua.BinaryDecoder) (any, error) {
+			var v string
+			err := dec.ReadString(&v)
+			return v, err
+		}, "hello"},
+		"long String": {cat(le32(int32(len(long))), long), func(dec *ua.BinaryDecoder) (any, error) {
+			var v string
+			err := dec.ReadString(&v)
+			return v, err
+		}, string(long)},
+		"ByteString": {cat(le32(int32(len(long))), long), func(dec *ua.BinaryDecoder) (any, error) {
+			var v ua.ByteString
+			err := dec.ReadByteString(&v)
+			return v, err
+		}, ua.ByteString(long)},
+		"ByteArray": {cat(le32(int32(len(long))), long), func(dec *ua.BinaryDecoder) (any, error) {
+			var v []byte
+			err := dec.ReadByteArray(&v)
+			return v, err
+		}, long},
+		"empty ByteArray": {le32(0), func(dec *ua.BinaryDecoder) (any, error) {
+			var v []byte
+			err := dec.ReadByteArray(&v)
+			return v, err
+		}, []byte{}},
+		"Boolean array": {cat(le32(int32(len(long))), bytes.Repeat([]byte{1}, len(long))), func(dec *ua.BinaryDecoder) (any, error) {
+			var v []bool
+			err := dec.ReadBooleanArray(&v)
+			return len(v), err
+		}, len(long)},
+	}
+	for name, c := range cases {
+		for kind, r := range readerKinds(c.input) {
+			got, err := c.decode(ua.NewBinaryDecoder(r, ec))
+			if err != nil {
+				t.Fatalf("%s/%s: %v", name, kind, err)
+			}
+			assert.DeepEqual(t, got, c.want)
+		}
+	}
+}
+
+func TestDecodeMemoryLimitGrowingInput(t *testing.T) {
+	// the memory allowed grows with an input that reports its length as int64 and
+	// grows between values.
+	ec := limitsContext{ua.DecodingLimits{MaxMemory: 1 << 20, MemoryPerInputByte: 10}}
+	partition := buffer.NewPartitionAt(buffer.NewMemPoolAt(1024))
+	dec := ua.NewBinaryDecoder(partition, ec)
+	partition.Write(cat(le32(1), []byte("a")))
+	var s string
+	if err := dec.ReadString(&s); err != nil {
+		t.Fatal(err)
+	}
+	// a DataValue takes 88 bytes, which the 17 bytes of input allow, but not the 6
+	// bytes read when its Variant is decoded.
+	partition.Write(cat([]byte{0x17, 0x00}, le32(6), []byte("abcdef")))
+	var v ua.Variant
+	if err := dec.ReadVariant(&v); err != nil {
+		t.Fatal(err)
+	}
+	if err := dec.ReadString(&s); err != nil {
+		t.Fatal(err)
+	}
+	assert.Equal(t, s, "abcdef")
 }
 
 func TestDecodeMemoryLimitErrorsOfCompositeValues(t *testing.T) {

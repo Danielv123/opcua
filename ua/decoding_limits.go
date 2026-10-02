@@ -17,7 +17,9 @@ package ua
 // Go types involved. An array is counted in full as soon as its length has been
 // checked against the remaining input, so that one that is too large is rejected
 // before memory is allocated for it. If the length of the input is unknown, the
-// input decoded so far is used, and arrays are counted as they grow.
+// input decoded so far is used, and Strings, ByteStrings and arrays are decoded in
+// chunks that are counted as they are allocated, and then joined, which briefly
+// takes twice their memory.
 type DecodingLimits struct {
 	// MaxMemory is the most memory, in bytes, that the values decoded from one input
 	// may take, or zero for no limit.
