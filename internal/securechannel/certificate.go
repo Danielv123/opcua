@@ -23,14 +23,22 @@ const MaxRSAKeyLength = 4096
 // in a certificate chain received from the peer. Validating the chain verifies certificate
 // signatures with these keys before the chain is known to be trusted, so their length is bounded
 // too. The limit is higher than MaxRSAKeyLength, so that chains with 8192 bit CA certificates remain
-// usable, but low enough to bound the cost of the verification.
-const MaxIssuerRSAKeyLength = 16384
+// usable.
+const MaxIssuerRSAKeyLength = 8192
 
-// CheckCertificateChain returns ua.BadCertificatePolicyCheckFailed if a certificate of a chain received
-// from the peer holds an RSA key that is too long: longer than MaxRSAKeyLength for the leaf certificate
-// (the first one), or longer than MaxIssuerRSAKeyLength for the other certificates. It must be called
-// before the chain is validated.
+// MaxCertificateChainLength is the maximum number of certificates in a certificate chain received from
+// the peer: the leaf certificate and its issuer certificates. Together with MaxIssuerRSAKeyLength it
+// bounds the number and cost of the signature checks made while the chain is validated.
+const MaxCertificateChainLength = 10
+
+// CheckCertificateChain returns ua.BadCertificatePolicyCheckFailed if a chain received from the peer
+// holds more than MaxCertificateChainLength certificates, or a certificate that holds an RSA key that
+// is too long: longer than MaxRSAKeyLength for the leaf certificate (the first one), or longer than
+// MaxIssuerRSAKeyLength for the other certificates. It must be called before the chain is validated.
 func CheckCertificateChain(certificates []*x509.Certificate) error {
+	if len(certificates) > MaxCertificateChainLength {
+		return ua.BadCertificatePolicyCheckFailed
+	}
 	for i, certificate := range certificates {
 		key, ok := certificate.PublicKey.(*rsa.PublicKey)
 		if !ok {

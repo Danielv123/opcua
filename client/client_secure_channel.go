@@ -284,9 +284,15 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		if err != nil || len(certs) == 0 {
 			return ua.BadSecurityChecksFailed
 		}
-		// bound the cost of the signature checks of the validation of the chain sent by the server.
+		// bound the cost of the signature checks of the validation of the chain sent by the server, and
+		// reject a server key that the security policy does not allow before the key is used.
 		if err := securechannel.CheckCertificateChain(certs); err != nil {
 			return err
+		}
+		if ch.securityPolicyURI != ua.SecurityPolicyURINone {
+			if _, err := securechannel.RSAPublicKey(certs[0], ch.securityPolicyURI); err != nil {
+				return err
+			}
 		}
 		err = ua.ValidateCertificate(
 			certs,

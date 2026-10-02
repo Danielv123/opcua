@@ -195,8 +195,9 @@ func TestClientRejectsKeyLengths(t *testing.T) {
 				if ch.remotePublicKey != nil {
 					t.Error("1024 bit server key was accepted")
 				}
-				if err := open(testClient, testShortServer.cert); err != ua.BadSecurityChecksFailed {
-					t.Errorf("Open() with a 1024 bit server key = %v, want %v", err, ua.BadSecurityChecksFailed)
+				// rejected before the certificate is validated.
+				if err := open(testClient, testShortServer.cert); err != ua.BadCertificatePolicyCheckFailed {
+					t.Errorf("Open() with a 1024 bit server key = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
 				}
 			}
 
@@ -242,7 +243,7 @@ func TestClientRejectsKeyLengths(t *testing.T) {
 func TestClientOpenRejectsInconsistentSecurityMode(t *testing.T) {
 	loadTestCredentials(t)
 	endpointURL := listenAcknowledge(t)
-	for name, cert := range map[string][]byte{"NoCertificate": nil, "ECDSA": testECDSACert} {
+	for name, cert := range map[string][]byte{"NoCertificate": nil, "RSACertificate": testServer.cert} {
 		ch := newTestClientSecureChannel(endpointURL, ua.SecurityPolicyURIBasic256Sha256, ua.MessageSecurityModeNone, testClient, cert)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err := ch.Open(ctx)
@@ -392,8 +393,8 @@ func TestClientDialRejectsUnsupportedServerCertificate(t *testing.T) {
 				t.Fatal("Dial succeeded, want an error")
 			}
 			// the endpoint may be rejected while it is selected, or when the channel is opened.
-			if err != ua.BadSecurityChecksFailed && err != ua.BadCertificateInvalid {
-				t.Fatalf("Dial() = %v, want %v or %v", err, ua.BadSecurityChecksFailed, ua.BadCertificateInvalid)
+			if err != ua.BadCertificatePolicyCheckFailed && err != ua.BadCertificateInvalid {
+				t.Fatalf("Dial() = %v, want %v or %v", err, ua.BadCertificatePolicyCheckFailed, ua.BadCertificateInvalid)
 			}
 		})
 	}

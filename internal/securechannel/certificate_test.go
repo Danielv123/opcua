@@ -186,6 +186,13 @@ func TestCheckCertificateChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	leaf := certificate(2048)
+	chainOf := func(n int) []*x509.Certificate {
+		chain := []*x509.Certificate{leaf}
+		for len(chain) < n {
+			chain = append(chain, certificate(2048))
+		}
+		return chain
+	}
 	cases := []struct {
 		name  string
 		chain []*x509.Certificate
@@ -198,6 +205,8 @@ func TestCheckCertificateChain(t *testing.T) {
 		{"IssuerMax", []*x509.Certificate{leaf, certificate(securechannel.MaxIssuerRSAKeyLength)}, true},
 		{"IssuerTooLong", []*x509.Certificate{leaf, certificate(securechannel.MaxIssuerRSAKeyLength + 1)}, false},
 		{"IssuerHuge", []*x509.Certificate{leaf, certificate(4096), certificate(1 << 17)}, false},
+		{"MaxChainLength", chainOf(securechannel.MaxCertificateChainLength), true},
+		{"ChainTooLong", chainOf(securechannel.MaxCertificateChainLength + 1), false},
 		{"ECDSA", []*x509.Certificate{ecdsaCert, leaf}, true},
 		{"Empty", nil, true},
 	}
