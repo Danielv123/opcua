@@ -424,18 +424,154 @@ func TestActivateSessionRejectsInvalidIdentityCertificate(t *testing.T) {
 	if err := dial(validCert, identityKey); err != nil {
 		t.Fatalf("Dial() with a valid identity = %v", err)
 	}
-	// a certificate with a 1 megabit modulus is rejected before the signature is verified with it.
-	start := time.Now()
-	if err := dial(hugeCert, identityKey); err != ua.BadIdentityTokenInvalid {
-		t.Errorf("Dial() with a huge identity key = %v, want %v", err, ua.BadIdentityTokenInvalid)
-	}
-	if d := time.Since(start); d > 10*time.Second {
-		t.Errorf("Dial() with a huge identity key took %v", d)
-	}
 	// a certificate with a 1024 bit key is rejected for the Basic256Sha256 token policy. The token is
 	// signed with a longer key, so that a client that checks its own key still sends it.
 	if err := dial(shortCert, identityKey); err != ua.BadIdentityTokenInvalid {
 		t.Errorf("Dial() with a 1024 bit identity key = %v, want %v", err, ua.BadIdentityTokenInvalid)
 	}
+
+	// a certificate with a 1 megabit modulus and a signature as long as the modulus is rejected quickly.
+	// Verifying the signature with the key would take a long time. The request is sent on a raw channel,
+	// since the client cannot sign with such a key.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	endpoints, err := client.GetEndpoints(ctx, &ua.GetEndpointsRequest{EndpointURL: endpointURL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyID := ""
+	for _, e := range endpoints.Endpoints {
+		if e.SecurityPolicyURI != ua.SecurityPolicyURINone {
+			continue
+		}
+		for _, token := range e.UserIdentityTokens {
+			if token.TokenType == ua.UserTokenTypeCertificate {
+				policyID = token.PolicyID
+			}
+		}
+	}
+	if policyID == "" {
+		t.Fatal("no X509 identity token policy for SecurityPolicy None")
+	}
+	ch := openRawNoneChannel(t, endpointURL)
+	nonce := make([]byte, 32)
+	rand.Read(nonce)
+	session, ok := decodeBody(t, ch.request(t, 2, securechanneltest.EncodeBody(ua.ObjectIDCreateSessionRequestEncodingDefaultBinary, &ua.CreateSessionRequest{
+		RequestHeader:           ua.RequestHeader{RequestHandle: 2, TimeoutHint: 10000},
+		ClientDescription:       ua.ApplicationDescription{ApplicationURI: "urn:localhost:rawclient", ApplicationType: ua.ApplicationTypeClient},
+		EndpointURL:             endpointURL,
+		SessionName:             "raw",
+		ClientNonce:             ua.ByteString(nonce),
+		RequestedSessionTimeout: 60000,
+	}))).(*ua.CreateSessionResponse)
+	if !ok {
+		t.Fatal("CreateSession failed")
+	}
+	signature := make([]byte, hugeKey.Size())
+	rand.Read(signature[1:]) // less than the modulus
+	start := time.Now()
+	res := decodeBody(t, ch.request(t, 3, securechanneltest.EncodeBody(ua.ObjectIDActivateSessionRequestEncodingDefaultBinary, &ua.ActivateSessionRequest{
+		RequestHeader:      ua.RequestHeader{AuthenticationToken: session.AuthenticationToken, RequestHandle: 3, TimeoutHint: 10000},
+		UserIdentityToken:  ua.X509IdentityToken{PolicyID: policyID, CertificateData: ua.ByteString(hugeCert)},
+		UserTokenSignature: ua.SignatureData{Algorithm: ua.RsaSha256Signature, Signature: ua.ByteString(signature)},
+	})))
+	if fault, ok := res.(*ua.ServiceFault); !ok || fault.ServiceResult != ua.BadIdentityTokenInvalid {
+		t.Errorf("ActivateSession() with a huge identity key = %#v, want %v", res, ua.BadIdentityTokenInvalid)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("ActivateSession() with a huge identity key took %v", d)
+	}
 	checkServerAvailable(t, endpointURL)
+}
+
+// openRawNoneChannel opens a secure channel with SecurityPolicy None over a raw connection.
+func openRawNoneChannel(t *testing.T, endpointURL string) *rawSecureChannel {
+	t.Helper()
+	conn := rawConnection(t, endpointURL)
+	opn := securechanneltest.AsymmetricChunk{PolicyURI: ua.SecurityPolicyURINone, SequenceNumber: 1, RequestID: 1,
+		Body: securechanneltest.EncodeBody(ua.ObjectIDOpenSecureChannelRequestEncodingDefaultBinary, &ua.OpenSecureChannelRequest{
+			RequestHeader:     ua.RequestHeader{RequestHandle: 1, TimeoutHint: 1000},
+			RequestType:       ua.SecurityTokenRequestTypeIssue,
+			SecurityMode:      ua.MessageSecurityModeNone,
+			RequestedLifetime: 3600000,
+		})}
+	chunk, err := opn.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(chunk); err != nil {
+		t.Fatal(err)
+	}
+	if chunk, err = securechanneltest.ReadChunk(conn); err != nil || binary.LittleEndian.Uint32(chunk) != ua.MessageTypeOpenFinal {
+		t.Fatalf("no OpenSecureChannel response: %v", err)
+	}
+	// message header, asymmetric security header with null certificate and thumbprint, sequence header.
+	bodyStart := 12 + 4 + len(ua.SecurityPolicyURINone) + 4 + 4 + 8
+	res, ok := decodeBody(t, chunk[bodyStart:]).(*ua.OpenSecureChannelResponse)
+	if !ok {
+		t.Fatal("OpenSecureChannel failed")
+	}
+	return &rawSecureChannel{conn: conn, mode: ua.MessageSecurityModeNone, channelID: res.SecurityToken.ChannelID, tokenID: res.SecurityToken.TokenID, sequenceNumber: 2}
+}
+
+// request sends a request body in message chunks on a channel with SecurityMode None, and returns the
+// body of the response.
+func (ch *rawSecureChannel) request(t *testing.T, requestID uint32, body []byte) []byte {
+	t.Helper()
+	for len(body) > 0 {
+		n := len(body)
+		messageType := ua.MessageTypeFinal
+		if n > 32*1024 {
+			n, messageType = 32*1024, ua.MessageTypeChunk
+		}
+		c := securechanneltest.SymmetricChunk{MessageType: messageType, ChannelID: ch.channelID, TokenID: ch.tokenID,
+			SequenceNumber: ch.sequenceNumber, RequestID: requestID, Body: body[:n], Policy: new(ua.SecurityPolicyNone), Mode: ch.mode}
+		ch.sequenceNumber++
+		if _, err := ch.conn.Write(c.Encode()); err != nil {
+			t.Fatal(err)
+		}
+		body = body[n:]
+	}
+	res := []byte{}
+	for {
+		chunk, err := securechanneltest.ReadChunk(ch.conn)
+		if err != nil {
+			t.Fatalf("no response: %v", err)
+		}
+		messageType := binary.LittleEndian.Uint32(chunk)
+		if messageType != ua.MessageTypeChunk && messageType != ua.MessageTypeFinal {
+			t.Fatalf("got message type %q, want a message", chunk[:4])
+		}
+		res = append(res, chunk[24:]...)
+		if messageType == ua.MessageTypeFinal {
+			return res
+		}
+	}
+}
+
+// decodeBody decodes the body of a response message.
+func decodeBody(t *testing.T, body []byte) any {
+	t.Helper()
+	dec := ua.NewBinaryDecoder(bytes.NewReader(body), ua.NewEncodingContext())
+	var id ua.NodeID
+	if err := dec.ReadNodeID(&id); err != nil {
+		t.Fatal(err)
+	}
+	var v any
+	switch id {
+	case ua.ObjectIDOpenSecureChannelResponseEncodingDefaultBinary:
+		v = new(ua.OpenSecureChannelResponse)
+	case ua.ObjectIDCreateSessionResponseEncodingDefaultBinary:
+		v = new(ua.CreateSessionResponse)
+	case ua.ObjectIDActivateSessionResponseEncodingDefaultBinary:
+		v = new(ua.ActivateSessionResponse)
+	case ua.ObjectIDServiceFaultEncodingDefaultBinary:
+		v = new(ua.ServiceFault)
+	default:
+		t.Fatalf("unexpected response %v", id)
+	}
+	if err := dec.Decode(v); err != nil {
+		t.Fatal(err)
+	}
+	return v
 }

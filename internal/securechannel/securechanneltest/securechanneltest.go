@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/awcullen/opcua/ua"
+	"github.com/djherbis/buffer"
 )
 
 // SymmetricKeys holds the keys that sign and encrypt symmetric chunks.
@@ -255,7 +256,9 @@ func Frame(messageType uint32, payload []byte) []byte {
 
 // EncodeBody encodes a service request or response, prefixed by its binary encoding id.
 func EncodeBody(id ua.NodeID, v any) []byte {
-	buf := new(bytes.Buffer)
+	// the encoder needs a buffer.BufferAt to encode extension objects of any size.
+	buf := buffer.NewPartitionAt(buffer.NewMemPoolAt(64 * 1024))
+	defer buf.Reset()
 	enc := ua.NewBinaryEncoder(buf, ua.NewEncodingContext())
 	if err := enc.WriteNodeID(id); err != nil {
 		panic(err)
@@ -263,7 +266,11 @@ func EncodeBody(id ua.NodeID, v any) []byte {
 	if err := enc.Encode(v); err != nil {
 		panic(err)
 	}
-	return buf.Bytes()
+	b, err := io.ReadAll(buf)
+	if err != nil {
+		panic(err)
+	}
+	return b
 }
 
 // AbortBody returns the body of an abort chunk (MSGA): the error and the reason.
