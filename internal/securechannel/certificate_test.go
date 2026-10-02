@@ -96,7 +96,7 @@ func TestParseRSAPublicKey(t *testing.T) {
 	}
 }
 
-// TestRSAKeyLength checks the minimum key length of each security policy (OPC UA Part 7).
+// TestRSAKeyLength checks the key lengths allowed by each security policy (OPC UA Part 7).
 func TestRSAKeyLength(t *testing.T) {
 	cert1024, key1024 := newRSACertificate(t, 1024)
 	cert2048, key2048 := newRSACertificate(t, 2048)
@@ -114,9 +114,28 @@ func TestRSAKeyLength(t *testing.T) {
 		cert []byte
 		key  *rsa.PrivateKey
 	}{{1024, cert1024, key1024}, {2048, cert2048, key2048}, {4096, cert4096, key4096}}
+	// certificates holding keys longer than MaxRSAKeyLength (signed with a shorter key).
+	longKeys := map[int]*rsa.PublicKey{}
+	longCerts := map[int][]byte{}
+	for _, bits := range []int{securechannel.MaxRSAKeyLength + 1, 8192, 65536} {
+		longKeys[bits] = &rsa.PublicKey{N: new(big.Int).SetBit(big.NewInt(1), bits-1, 1), E: 65537}
+		cert, err := securechanneltest.NewCertificate("urn:test:long", key2048, longKeys[bits])
+		if err != nil {
+			t.Fatal(err)
+		}
+		longCerts[bits] = cert
+	}
 	for _, policyURI := range allPolicyURIs {
 		if got := securechannel.MinRSAKeyLength(policyURI); got != minLength[policyURI] {
 			t.Errorf("MinRSAKeyLength(%s) = %d, want %d", policyURI, got, minLength[policyURI])
+		}
+		for bits, cert := range longCerts {
+			if key, err := securechannel.ParseRSAPublicKey(cert, policyURI); err != ua.BadCertificatePolicyCheckFailed || key != nil {
+				t.Errorf("%s: %d bit certificate: got (%v, %v), want %v", policyURI, bits, key, err, ua.BadCertificatePolicyCheckFailed)
+			}
+			if err := securechannel.CheckRSAKey(longKeys[bits], policyURI); err != ua.BadCertificatePolicyCheckFailed {
+				t.Errorf("%s: CheckRSAKey(%d bit key) = %v, want %v", policyURI, bits, err, ua.BadCertificatePolicyCheckFailed)
+			}
 		}
 		for _, k := range keys {
 			allowed := k.bits >= minLength[policyURI]

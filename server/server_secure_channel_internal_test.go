@@ -35,6 +35,7 @@ var (
 	testECDSACert       []byte
 	testEd25519Cert     []byte
 	testSmallRSACert    []byte // 512 bit
+	testLongRSACert     []byte // 8192 bit, longer than any security policy allows
 )
 
 func loadTestCredentials(t *testing.T) {
@@ -76,7 +77,15 @@ func loadTestCredentials(t *testing.T) {
 		if testSmallRSACert, err = securechanneltest.NewCertificate("urn:localhost:small", testClient.key, smallKey); err != nil {
 			panic(err)
 		}
+		if testLongRSACert, err = securechanneltest.NewCertificate("urn:localhost:long", testClient.key, testLongKey()); err != nil {
+			panic(err)
+		}
 	})
+}
+
+// testLongKey returns an (unusable) 8192 bit RSA public key, longer than any security policy allows.
+func testLongKey() *rsa.PublicKey {
+	return &rsa.PublicKey{N: new(big.Int).SetBit(big.NewInt(1), 8191, 1), E: 65537}
 }
 
 type testPolicy struct {
@@ -207,7 +216,7 @@ func mustEncode(t *testing.T, c securechanneltest.AsymmetricChunk) []byte {
 func TestServerRejectsUnsupportedCertificate(t *testing.T) {
 	loadTestCredentials(t)
 	p := testRSAPolicies[2]
-	for name, cert := range map[string][]byte{"ECDSA": testECDSACert, "Ed25519": testEd25519Cert, "RSA512": testSmallRSACert, "Garbage": {1, 2, 3}} {
+	for name, cert := range map[string][]byte{"ECDSA": testECDSACert, "Ed25519": testEd25519Cert, "RSA512": testSmallRSACert, "RSA8192": testLongRSACert, "Garbage": {1, 2, 3}} {
 		t.Run(name, func(t *testing.T) {
 			ch, peer := newTestServerChannel(t, testServer)
 			c := testOpenChunk(p, testClient, testServer, 1)
@@ -252,9 +261,10 @@ func TestServerRejectsShortClientKey(t *testing.T) {
 	}
 }
 
-// TestServerRejectsPolicyForShortServerKey checks that a server whose certificate holds a key shorter
-// than a security policy requires rejects channels with that policy, instead of providing a weaker channel.
-func TestServerRejectsPolicyForShortServerKey(t *testing.T) {
+// TestServerRejectsPolicyForServerKeyLength checks that a server whose certificate holds a key with a
+// length that a security policy does not allow rejects channels with that policy, instead of providing
+// a weaker channel.
+func TestServerRejectsPolicyForServerKeyLength(t *testing.T) {
 	loadTestCredentials(t)
 	for _, p := range testRSAPolicies {
 		t.Run(p.uri[len("http://opcfoundation.org/UA/SecurityPolicy#"):], func(t *testing.T) {
@@ -266,6 +276,13 @@ func TestServerRejectsPolicyForShortServerKey(t *testing.T) {
 			}
 			if !allowed && err != ua.BadSecurityPolicyRejected {
 				t.Fatalf("readRequest() = %v, want %v", err, ua.BadSecurityPolicyRejected)
+			}
+
+			// a key longer than any security policy allows.
+			long := testCredential{cert: testServer.cert, key: &rsa.PrivateKey{PublicKey: *testLongKey()}}
+			ch, peer = newTestServerChannel(t, long)
+			if _, _, err = readTestRequest(t, ch, peer, mustEncode(t, testOpenChunk(p, testClient, testServer, 1))); err != ua.BadSecurityPolicyRejected {
+				t.Fatalf("readRequest() with an 8192 bit server key = %v, want %v", err, ua.BadSecurityPolicyRejected)
 			}
 		})
 	}

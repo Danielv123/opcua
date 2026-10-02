@@ -9,15 +9,21 @@ import (
 	"github.com/awcullen/opcua/ua"
 )
 
+// MaxRSAKeyLength is the maximum length, in bits, of the RSA keys allowed by any security policy.
+//
+// It is enforced for all policies. It bounds the cost of the RSA operations made with a peer key
+// before the peer certificate is validated: without it, a peer could send a certificate with a very
+// long modulus (and a large public exponent) to make every OpenSecureChannel attempt expensive.
+// The deprecated Basic128Rsa15 and Basic256 policies specify a maximum of 2048 bits; longer keys up
+// to MaxRSAKeyLength are accepted for them, since a longer key does not weaken these policies, and
+// rejecting them would break deployments that use 4096 bit certificates with these policies.
+const MaxRSAKeyLength = 4096
+
 // MinRSAKeyLength returns the minimum length, in bits, of the RSA keys allowed by a security policy,
 // i.e. the minimum AsymmetricKeyLength of the policy (OPC UA Part 7): 1024 bits for the deprecated
 // Basic128Rsa15 and Basic256 policies, and 2048 bits for Basic256Sha256, Aes128_Sha256_RsaOaep and
 // Aes256_Sha256_RsaPss. For SecurityPolicy None, where a key may still encrypt user identity tokens,
 // it returns the minimum of all RSA based policies.
-//
-// The maximum AsymmetricKeyLength of the policies (2048 or 4096 bits) is not enforced: a longer key
-// does not weaken the channel, the chunk sizes are validated separately, and rejecting longer keys
-// would break peers that work today, e.g. with 4096 bit certificates for Basic256.
 func MinRSAKeyLength(securityPolicyURI string) int {
 	switch securityPolicyURI {
 	case ua.SecurityPolicyURIBasic256Sha256, ua.SecurityPolicyURIAes128Sha256RsaOaep, ua.SecurityPolicyURIAes256Sha256RsaPss:
@@ -28,17 +34,20 @@ func MinRSAKeyLength(securityPolicyURI string) int {
 }
 
 // CheckRSAKey returns ua.BadCertificatePolicyCheckFailed if the RSA key is shorter than the security
-// policy allows (see MinRSAKeyLength).
+// policy allows (see MinRSAKeyLength), or longer than MaxRSAKeyLength.
 func CheckRSAKey(key *rsa.PublicKey, securityPolicyURI string) error {
-	if key == nil || key.N == nil || key.N.BitLen() < MinRSAKeyLength(securityPolicyURI) {
+	if key == nil || key.N == nil {
+		return ua.BadCertificatePolicyCheckFailed
+	}
+	if n := key.N.BitLen(); n < MinRSAKeyLength(securityPolicyURI) || n > MaxRSAKeyLength {
 		return ua.BadCertificatePolicyCheckFailed
 	}
 	return nil
 }
 
 // RSAPublicKey returns the public key of a certificate received from the remote peer, for use with
-// the given security policy. It returns an error if the key is not an RSA key, or is shorter than
-// the security policy allows, so the returned key is safe to use for RSA operations.
+// the given security policy. It returns an error if the key is not an RSA key, or its length is not
+// allowed (see CheckRSAKey), so the returned key is safe to use for RSA operations.
 func RSAPublicKey(certificate *x509.Certificate, securityPolicyURI string) (*rsa.PublicKey, error) {
 	if certificate == nil {
 		return nil, ua.BadCertificateInvalid

@@ -429,7 +429,7 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		if ch.localPrivateKey == nil {
 			return ua.BadSecurityChecksFailed
 		}
-		// the client certificate must hold a key that is long enough for the security policy.
+		// the security policy must allow the length of the key of the client certificate.
 		if err := securechannel.CheckRSAKey(&ch.localPrivateKey.PublicKey, ch.securityPolicyURI); err != nil {
 			return err
 		}

@@ -1285,9 +1285,9 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 					return nil, 0, ua.BadSecurityChecksFailed
 				}
 
-				// the server cannot provide a security policy that requires a longer key than its own.
+				// the server cannot provide a security policy that does not allow the length of its own key.
 				if err := securechannel.CheckRSAKey(&ch.localPrivateKey.PublicKey, ch.securityPolicyURI); err != nil {
-					log.Printf("Error opening secure channel. The key of the server certificate is too short for security policy %s.\n", ch.securityPolicyURI)
+					log.Printf("Error opening secure channel. The key length of the server certificate is not allowed by security policy %s.\n", ch.securityPolicyURI)
 					return nil, 0, ua.BadSecurityPolicyRejected
 				}
 

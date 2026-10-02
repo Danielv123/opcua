@@ -166,9 +166,10 @@ func TestClientRejectsUnsupportedCertificate(t *testing.T) {
 	}
 }
 
-// TestClientRejectsShortKeys checks that a server certificate, or a client certificate, with a key shorter
-// than the security policy allows is rejected: 1024 bit keys are allowed for Basic128Rsa15 and Basic256 only.
-func TestClientRejectsShortKeys(t *testing.T) {
+// TestClientRejectsKeyLengths checks that a server certificate, or a client certificate, with a key shorter
+// than the security policy allows, or longer than any policy allows, is rejected: 1024 bit keys are allowed
+// for Basic128Rsa15 and Basic256 only.
+func TestClientRejectsKeyLengths(t *testing.T) {
 	loadTestCredentials(t)
 	endpointURL := listenAcknowledge(t)
 	for _, p := range testRSAPolicies {
@@ -204,6 +205,20 @@ func TestClientRejectsShortKeys(t *testing.T) {
 				if err := open(testShortClient, testServer.cert); err != ua.BadCertificatePolicyCheckFailed {
 					t.Errorf("Open() with a 1024 bit client key = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
 				}
+			}
+
+			// keys longer than any security policy allows.
+			longKey := &rsa.PublicKey{N: new(big.Int).SetBit(big.NewInt(1), 8191, 1), E: 65537}
+			longCert, err := securechanneltest.NewCertificate("urn:localhost:long", testServer.key, longKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ch := newTestClientSecureChannel(endpointURL, p.uri, ua.MessageSecurityModeSignAndEncrypt, testClient, longCert); ch.remotePublicKey != nil {
+				t.Error("8192 bit server key was accepted")
+			}
+			long := testCredential{cert: testClient.cert, key: &rsa.PrivateKey{PublicKey: *longKey}}
+			if err := open(long, testServer.cert); err != ua.BadCertificatePolicyCheckFailed {
+				t.Errorf("Open() with an 8192 bit client key = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
 			}
 		})
 	}
