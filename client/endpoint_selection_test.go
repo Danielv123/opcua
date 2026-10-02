@@ -684,6 +684,51 @@ func TestSelectEndpoint(t *testing.T) {
 	}
 }
 
+// TestSelectEndpointClientKeySize verifies that automatic selection skips the security policies that the length
+// of the client's RSA key is not suitable for: at least 1024 bits for Basic128Rsa15 and Basic256, at least 2048
+// bits for the other policies, and at most 4096 bits.
+func TestSelectEndpointClientKeySize(t *testing.T) {
+	serverCert := newTestRSACertificate(t)
+	clientCert := []byte(newTestRSACertificate(t))
+	// only the length of the client's key matters for selection, so the keys need not be valid.
+	keyOfSize := func(bits int) *rsa.PrivateKey {
+		return &rsa.PrivateKey{PublicKey: rsa.PublicKey{N: new(big.Int).Lsh(big.NewInt(1), uint(bits-1)), E: 65537}}
+	}
+	endpoints := []ua.EndpointDescription{
+		testEndpoint(ua.SecurityPolicyURINone, ua.MessageSecurityModeNone, 0, serverCert, anonymousToken("anon_0"), userNameToken("user_0", ua.SecurityPolicyURIBasic256Sha256)),
+		testEndpoint(ua.SecurityPolicyURIBasic128Rsa15, ua.MessageSecurityModeSignAndEncrypt, 1, serverCert, anonymousToken("anon_1"), userNameToken("user_1", ua.SecurityPolicyURIBasic128Rsa15)),
+		testEndpoint(ua.SecurityPolicyURIBasic256, ua.MessageSecurityModeSignAndEncrypt, 2, serverCert, anonymousToken("anon_2"), userNameToken("user_2", ua.SecurityPolicyURIBasic256)),
+		testEndpoint(ua.SecurityPolicyURIBasic256Sha256, ua.MessageSecurityModeSignAndEncrypt, 3, serverCert, anonymousToken("anon_3"), userNameToken("user_3", ua.SecurityPolicyURIBasic256Sha256)),
+	}
+	tests := []struct {
+		name       string
+		opts       []Option
+		wantPolicy string
+		wantErr    error
+	}{
+		{name: "1024-bit key selects Basic256 over Basic256Sha256", opts: []Option{WithClientCertificate(clientCert, keyOfSize(1024))}, wantPolicy: ua.SecurityPolicyURIBasic256},
+		{name: "2048-bit key selects Basic256Sha256", opts: []Option{WithClientCertificate(clientCert, keyOfSize(2048))}, wantPolicy: ua.SecurityPolicyURIBasic256Sha256},
+		{name: "4096-bit key selects Basic256Sha256", opts: []Option{WithClientCertificate(clientCert, keyOfSize(4096))}, wantPolicy: ua.SecurityPolicyURIBasic256Sha256},
+		{name: "8192-bit key selects no RSA policy", opts: []Option{WithClientCertificate(clientCert, keyOfSize(8192))}, wantPolicy: ua.SecurityPolicyURINone},
+		{name: "8192-bit key with credentials fails", opts: []Option{WithClientCertificate(clientCert, keyOfSize(8192)), WithUserNameIdentity("user", "password")}, wantErr: ua.BadSecurityModeRejected},
+		{name: "512-bit key selects no RSA policy", opts: []Option{WithClientCertificate(clientCert, keyOfSize(512))}, wantPolicy: ua.SecurityPolicyURINone},
+		{name: "key size from certificate without private key", opts: []Option{WithClientCertificate(clientCert, nil)}, wantPolicy: ua.SecurityPolicyURIBasic256Sha256},
+		{name: "requested policy is not skipped", opts: []Option{WithClientCertificate(clientCert, keyOfSize(1024)), WithSecurityPolicyURI(ua.SecurityPolicyURIBasic256Sha256, ua.MessageSecurityModeInvalid)}, wantPolicy: ua.SecurityPolicyURIBasic256Sha256},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cli := newTestClient(t, tt.opts...)
+			e, _, err := cli.selectEndpoint(endpoints)
+			if err != tt.wantErr {
+				t.Fatalf("selectEndpoint() error = %v, want %v", err, tt.wantErr)
+			}
+			if err == nil && e.SecurityPolicyURI != tt.wantPolicy {
+				t.Errorf("selectEndpoint() = %s, want %s", e.SecurityPolicyURI, tt.wantPolicy)
+			}
+		})
+	}
+}
+
 func TestWithMinSecurityModeRejectsInvalidMode(t *testing.T) {
 	cli := &Client{}
 	if err := WithMinSecurityMode(ua.MessageSecurityModeInvalid)(cli); err != ua.BadInvalidArgument {

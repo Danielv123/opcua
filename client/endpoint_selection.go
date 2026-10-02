@@ -19,7 +19,8 @@ import (
 // own requirements:
 //   - the endpoint matches the security policy URI and message security mode requested with WithSecurityPolicyURI, if any.
 //   - the endpoint's message security mode is at least the minimum security mode (see WithMinSecurityMode).
-//   - a secured endpoint has a usable server certificate, and the client has a certificate.
+//   - a secured endpoint has a usable server certificate, and the client has a certificate. Unless the security
+//     policy was requested with WithSecurityPolicyURI, the client's RSA key must also suit the policy.
 //   - the endpoint offers a user token policy that does not expose the client's credentials (see selectUserTokenPolicy).
 //
 // Endpoints are ranked by decreasing security level, then security mode, then security policy strength, so the
@@ -38,6 +39,7 @@ func (ch *Client) selectEndpoint(endpoints []ua.EndpointDescription) (*ua.Endpoi
 	})
 
 	minSecurityMode := ch.effectiveMinSecurityMode()
+	localKeySize := ch.localKeySize()
 	keySizes := make(map[ua.ByteString]int) // RSA key size of each distinct server certificate, so each is parsed once.
 	var reason error = ua.BadSecurityModeRejected
 	var selected *ua.EndpointDescription
@@ -65,6 +67,12 @@ func (ch *Client) selectEndpoint(endpoints []ua.EndpointDescription) (*ua.Endpoi
 			}
 			// a secured channel requires a client certificate.
 			if len(ch.localCertificate) == 0 {
+				continue
+			}
+			// when the policy is selected automatically, skip the policies that the client's key is not suitable for.
+			// A policy requested with WithSecurityPolicyURI is not skipped, so opening the channel fails instead.
+			if ch.securityPolicyURI == ua.SecurityPolicyURIBestAvailable && localKeySize > 0 &&
+				(localKeySize < minRSAKeySize(e.SecurityPolicyURI) || localKeySize > maxRSAKeySize) {
 				continue
 			}
 		}
@@ -271,6 +279,17 @@ func rsaKeySize(certificate ua.ByteString) int {
 		return 0
 	}
 	return key.N.BitLen()
+}
+
+// maxRSAKeySize is the maximum size in bits of the client's RSA key for any security policy.
+const maxRSAKeySize = 4096
+
+// localKeySize returns the size in bits of the client's RSA key, or 0 if it is not known.
+func (ch *Client) localKeySize() int {
+	if ch.localPrivateKey != nil && ch.localPrivateKey.N != nil {
+		return ch.localPrivateKey.N.BitLen()
+	}
+	return rsaKeySize(ua.ByteString(ch.localCertificate))
 }
 
 // minRSAKeySize returns the minimum RSA key size in bits that the security policy requires.
