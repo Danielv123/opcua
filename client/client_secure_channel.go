@@ -339,12 +339,12 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 	//   log.Printf("Hello{\"Version\":%d,\"ReceiveBufferSize\":%d,\"SendBufferSize\":%d,\"MaxMessageSize\":%d,\"MaxChunkCount\":%d,\"EndpointURL\":\"%s\"}\n", protocolVersion, ch.receiveBufferSize, ch.sendBufferSize, ch.maxResponseMessageSize, ch.maxResponseChunkCount, ch.endpointURL)
 	// }
 
-	_, err = ch.Read(buf)
+	n, err := ch.Read(buf)
 	if err != nil {
 		return err
 	}
 
-	var reader = bytes.NewReader(buf)
+	var reader = bytes.NewReader(buf[:n])
 	var dec = ua.NewBinaryDecoder(reader, ch)
 	var msgType uint32
 	if err := dec.ReadUInt32(&msgType); err != nil {
@@ -374,6 +374,11 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 		// read the remote sendBufferSize into the local receiveBufferSize
 		if err := dec.ReadUInt32(&ch.receiveBufferSize); err != nil {
 			return err
+		}
+		// OPC UA Part 6 requires buffers of at least 8192 bytes.
+		const minBufferSize = 8192
+		if ch.sendBufferSize < minBufferSize || ch.receiveBufferSize < minBufferSize {
+			return ua.BadTCPNotEnoughResources
 		}
 		if err := dec.ReadUInt32(&ch.maxRequestMessageSize); err != nil {
 			return err
