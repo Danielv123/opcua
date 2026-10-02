@@ -19,7 +19,8 @@ package ua
 // before memory is allocated for it. If the length of the input is unknown, the
 // input decoded so far is used, and Strings, ByteStrings and arrays are decoded in
 // chunks that are counted as they are allocated, and then joined, which briefly
-// takes twice their memory.
+// takes twice their memory. The list of the chunks of an array is counted too, so
+// such arrays need a MinMemory that leaves room for it.
 type DecodingLimits struct {
 	// MaxMemory is the most memory, in bytes, that the values decoded from one input
 	// may take, or zero for no limit.

@@ -41,6 +41,11 @@ const (
 	// elements are decoded.
 	maxPreallocRatio = 4
 
+	// minChunkBytes is the least that a String or ByteString of unknown length is read
+	// in at a time, ahead of allocating memory for it if need be, so that the chunks
+	// it is read in are few, even if little memory may be allocated.
+	minChunkBytes = 4096
+
 	// maxEmptyArraySlices limits the number of slices at each level of a
 	// multi-dimensional array with no elements, e.g. one of ArrayDimensions [n, 0],
 	// so that the memory such an array uses stays proportional to its encoding.
@@ -97,6 +102,9 @@ type BinaryDecoder struct {
 	// depth is the current nesting depth of Variants, DataValues, ExtensionObjects
 	// and DiagnosticInfos.
 	depth int
+
+	// scratch holds bytes read ahead of allocating memory for them.
+	scratch []byte
 }
 
 // NewBinaryDecoder returns a new decoder that reads from an io.Reader.
@@ -223,30 +231,57 @@ func (dec *BinaryDecoder) readBytes(n int) ([]byte, error) {
 	// the number of unread bytes is unknown, so read the bytes in chunks.
 	var chunks [][]byte
 	for total := 0; total < n; {
-		k := dec.chunkLen(total, n, 1)
-		if err := dec.allocate(int64(k)); err != nil {
-			return nil, err
-		}
-		chunk := make([]byte, k)
-		if err := dec.readFull(chunk); err != nil {
-			return nil, BadDecodingError
+		var chunk []byte
+		if k := dec.chunkLen(total, n, 1, 0); k >= min(minChunkBytes, n-total) {
+			if err := dec.allocate(int64(k)); err != nil {
+				return nil, err
+			}
+			chunk = make([]byte, k)
+			if err := dec.readFull(chunk); err != nil {
+				return nil, BadDecodingError
+			}
+		} else {
+			// little memory may be allocated now, so read ahead, which allows more.
+			if dec.scratch == nil {
+				dec.scratch = make([]byte, minChunkBytes)
+			}
+			k = min(minChunkBytes, n-total)
+			if err := dec.readFull(dec.scratch[:k]); err != nil {
+				return nil, BadDecodingError
+			}
+			if err := dec.allocate(int64(k)); err != nil {
+				return nil, err
+			}
+			chunk = make([]byte, k)
+			copy(chunk, dec.scratch)
 		}
 		chunks = append(chunks, chunk)
-		total += k
+		total += len(chunk)
 	}
 	return joinChunks(chunks, n), nil
 }
 
 // chunkLen returns the number of elements of size bytes to allocate next for a
 // value of n elements, of which total have been decoded, from an input of unknown
-// length. The memory the value will take cannot be known in advance, so its elements
-// are decoded in chunks of at most maxPreallocBytes at first, then of at most as many
+// length, where overhead is the memory that the chunk takes besides its elements.
+// The memory the value will take cannot be known in advance, so its elements are
+// decoded in chunks of at most maxPreallocBytes at first, then of at most as many
 // elements as have been decoded, so that the memory stays proportional to the input
-// decoded, and of no more than the memory that may be allocated now, which grows with
-// the input.
-func (dec *BinaryDecoder) chunkLen(total, n int, size int64) int {
-	k := int64(min(max(total, int(maxPreallocBytes/size)), n-total))
-	return int(min(k, max(1, (dec.allowedMemory()-dec.used)/size)))
+// decoded, and of no more than the memory that may be allocated now, which grows
+// with the input.
+func (dec *BinaryDecoder) chunkLen(total, n int, size, overhead int64) int {
+	k := int64(min(max(total, int(maxPreallocBytes/size), 1), n-total))
+	return int(min(k, max(1, (dec.allowedMemory()-dec.used-overhead)/size)))
+}
+
+// chunkOverhead returns the memory that the chunk after the given number of chunks
+// takes besides its elements: none for the first chunk, and the slice that holds
+// it in the list of chunks for each later chunk.
+func chunkOverhead(chunks int) int64 {
+	if chunks == 0 {
+		return 0
+	}
+	return sliceHeaderSize
 }
 
 // joinChunks returns the n elements of the chunks in one slice. Until the chunks
@@ -391,8 +426,9 @@ func readArrayChunks[T any](dec *BinaryDecoder, n int, read func(*BinaryDecoder,
 	size := int64(unsafe.Sizeof(zero))
 	chunks := [][]T{}
 	for total := 0; total < n; {
-		k := dec.chunkLen(total, n, size)
-		if err := dec.allocate(int64(k) * size); err != nil {
+		overhead := chunkOverhead(len(chunks))
+		k := dec.chunkLen(total, n, size, overhead)
+		if err := dec.allocate(int64(k)*size + overhead); err != nil {
 			return nil, err
 		}
 		chunk := make([]T, k)
@@ -660,8 +696,9 @@ func getSliceDecoder(typ reflect.Type) (decoderFunc, error) {
 			// the number of unread bytes is unknown, so decode the elements in chunks.
 			var chunks []reflect.Value
 			for total := 0; total < n; {
-				k := buf.chunkLen(total, n, int64(elemSize))
-				if err := buf.allocate(int64(k) * int64(elemSize)); err != nil {
+				overhead := chunkOverhead(len(chunks))
+				k := buf.chunkLen(total, n, int64(elemSize), overhead)
+				if err := buf.allocate(int64(k)*int64(elemSize) + overhead); err != nil {
 					return err
 				}
 				chunk := reflect.MakeSlice(typ, k, k)

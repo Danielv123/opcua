@@ -5,6 +5,8 @@ package ua_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"reflect"
 	"runtime"
 	"testing"
 	"time"
@@ -236,11 +238,6 @@ func TestDecodeMemoryLimitPerInputByteOnly(t *testing.T) {
 			err := dec.ReadByteArray(&v)
 			return v, err
 		}, []byte{}},
-		"Boolean array": {cat(le32(int32(len(long))), bytes.Repeat([]byte{1}, len(long))), func(dec *ua.BinaryDecoder) (any, error) {
-			var v []bool
-			err := dec.ReadBooleanArray(&v)
-			return len(v), err
-		}, len(long)},
 	}
 	for name, c := range cases {
 		for kind, r := range readerKinds(c.input) {
@@ -250,6 +247,47 @@ func TestDecodeMemoryLimitPerInputByteOnly(t *testing.T) {
 			}
 			assert.DeepEqual(t, got, c.want)
 		}
+	}
+
+	// arrays of unknown length need a little more memory, for the list of chunks they
+	// are decoded in.
+	ec = limitsContext{ua.DecodingLimits{MaxMemory: 1 << 20, MinMemory: 1024, MemoryPerInputByte: 2}}
+	for kind, r := range readerKinds(cat(le32(int32(len(long))), bytes.Repeat([]byte{1}, len(long)))) {
+		var v []bool
+		if err := ua.NewBinaryDecoder(r, ec).ReadBooleanArray(&v); err != nil {
+			t.Fatalf("Boolean array/%s: %v", kind, err)
+		}
+		if len(v) != len(long) {
+			t.Fatalf("Boolean array/%s: decoded %d elements", kind, len(v))
+		}
+	}
+}
+
+func TestDecodeMemoryLimitChunksAreFew(t *testing.T) {
+	// a value of unknown length is decoded in few chunks, even if the limits allow
+	// little more memory than the input.
+	ec := limitsContext{ua.DecodingLimits{MaxMemory: 2 << 20, MemoryPerInputByte: 1}}
+	const n = 1 << 20
+	input := cat(le32(n), make([]byte, n))
+	r := &opaqueReader{bytes.NewReader(input)}
+	dec := ua.NewBinaryDecoder(r, ec)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	var v []byte
+	if err := dec.ReadByteArray(&v); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if len(v) != n {
+		t.Fatalf("decoded %d bytes", len(v))
+	}
+	// the chunks, the list of chunks, and the joined value.
+	if a := after.TotalAlloc - before.TotalAlloc; a > 3*n {
+		t.Fatalf("decoder allocated %d bytes", a)
+	}
+	if m := after.Mallocs - before.Mallocs; m > n/4096+100 {
+		t.Fatalf("decoder allocated %d times", m)
 	}
 }
 
@@ -275,6 +313,35 @@ func TestDecodeMemoryLimitGrowingInput(t *testing.T) {
 		t.Fatal(err)
 	}
 	assert.Equal(t, s, "abcdef")
+}
+
+func TestDecodeLargeElementsOfUnknownLength(t *testing.T) {
+	// an array of elements larger than maxPreallocBytes decodes from an input of
+	// unknown length.
+	fields := make([]reflect.StructField, 9000)
+	for i := range fields {
+		fields[i] = reflect.StructField{Name: fmt.Sprintf("F%d", i), Type: reflect.TypeOf(int64(0))}
+	}
+	typ := reflect.SliceOf(reflect.StructOf(fields))
+	input := cat(le32(2), make([]byte, 2*9000*8))
+	for kind, r := range readerKinds(input) {
+		v := reflect.New(typ)
+		done := make(chan error, 1)
+		go func() {
+			done <- ua.NewBinaryDecoder(r, ua.NewEncodingContext()).Decode(v.Interface())
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: %v", kind, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: decoding did not finish", kind)
+		}
+		if n := v.Elem().Len(); n != 2 {
+			t.Fatalf("%s: decoded %d elements", kind, n)
+		}
+	}
 }
 
 func TestDecodeMemoryLimitErrorsOfCompositeValues(t *testing.T) {
