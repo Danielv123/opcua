@@ -274,20 +274,55 @@ func (dec *BinaryDecoder) allocate(n int64) error {
 	return dec.checkMemory()
 }
 
-// allocateArray accounts for the n bytes of memory that an array takes once decoded,
-// where rem is the number of unread bytes of the input, or -1 if unknown. If the
-// number of unread bytes is unknown, the memory the array may take cannot be known
-// in advance, so its elements are accounted for as they are decoded instead.
-func (dec *BinaryDecoder) allocateArray(n int64, rem int64) error {
-	if rem < 0 {
-		return nil
+// allocateArray accounts for the memory of an array of n elements of elemSize bytes,
+// where rem is the number of unread bytes of the input, or -1 if unknown, and
+// returns the capacity to allocate for it before its elements are decoded. It also
+// returns the memory reserved for the array, which the caller must release once the
+// array has been decoded, or has failed to decode.
+//
+// If the number of unread bytes is known, the array is accounted for in full, so that
+// an array that is too large is rejected before memory is allocated for it. Otherwise,
+// the memory the array will take cannot be known in advance, so the capacity is
+// limited to the memory that may be allocated now, and is accounted for, and the
+// caller accounts for the elements beyond it as they are decoded.
+func (dec *BinaryDecoder) allocateArray(n int, elemSize uintptr, rem int64) (int, int64, error) {
+	size := int64(elemSize)
+	if rem >= 0 {
+		if err := dec.allocate(int64(n) * size); err != nil {
+			return 0, 0, err
+		}
+		c, reserved := dec.reserve(n, elemSize, rem)
+		return c, reserved, nil
 	}
-	return dec.allocate(n)
+	c, reserved := dec.reserve(n, elemSize, rem)
+	if size > 0 {
+		if avail := dec.allowedMemory() - dec.used; int64(c)*size > avail {
+			c = int(max(1, avail/size))
+			dec.reserved -= reserved - int64(c)*size
+			reserved = int64(c) * size
+		}
+	}
+	if err := dec.allocate(int64(c) * size); err != nil {
+		dec.reserved -= reserved
+		return 0, 0, err
+	}
+	return c, reserved, nil
 }
 
 // checkMemory computes the memory the decoded values may take, which grows with the
 // input, and returns BadEncodingLimitsExceeded if they take more.
 func (dec *BinaryDecoder) checkMemory() error {
+	dec.allowed = dec.allowedMemory()
+	if dec.used > dec.allowed {
+		dec.limitExceeded = true
+		return BadEncodingLimitsExceeded
+	}
+	return nil
+}
+
+// allowedMemory returns the memory the decoded values may take, which grows with the
+// input.
+func (dec *BinaryDecoder) allowedMemory() int64 {
 	l := dec.limits
 	allowed := int64(math.MaxInt64)
 	if l.MemoryPerInputByte > 0 {
@@ -303,12 +338,7 @@ func (dec *BinaryDecoder) checkMemory() error {
 	if l.MaxMemory > 0 {
 		allowed = min(allowed, l.MaxMemory)
 	}
-	dec.allowed = allowed
-	if dec.used > allowed {
-		dec.limitExceeded = true
-		return BadEncodingLimitsExceeded
-	}
-	return nil
+	return allowed
 }
 
 // limitError returns the error with which decoding a value failed, or
@@ -341,13 +371,13 @@ func readArray[T any](dec *BinaryDecoder, minSize int64, read func(*BinaryDecode
 	}
 	var zero T
 	size := int64(unsafe.Sizeof(zero))
-	if err := dec.allocateArray(int64(n)*size, rem); err != nil {
+	c, reserved, err := dec.allocateArray(n, uintptr(size), rem)
+	if err != nil {
 		return nil, dec.limitError(err)
 	}
-	c, reserved := dec.reserve(n, uintptr(size), rem)
 	values := make([]T, 0, c)
 	for i := 0; i < n; i++ {
-		if rem < 0 {
+		if rem < 0 && i >= c {
 			if err = dec.allocate(size); err != nil {
 				break
 			}
@@ -607,13 +637,14 @@ func getSliceDecoder(typ reflect.Type) (decoderFunc, error) {
 		if err != nil {
 			return err
 		}
-		if err := buf.allocateArray(int64(n)*int64(elemSize), rem); err != nil {
+		c, reserved, err := buf.allocateArray(n, elemSize, rem)
+		if err != nil {
 			return err
 		}
-		c, reserved := buf.reserve(n, elemSize, rem)
+		initial := c
 		s := reflect.MakeSlice(typ, c, c)
 		for i := 0; i < n; i++ {
-			if rem < 0 {
+			if rem < 0 && i >= initial {
 				if err = buf.allocate(int64(elemSize)); err != nil {
 					break
 				}
@@ -989,7 +1020,7 @@ func (dec *BinaryDecoder) ReadNodeID(value *NodeID) error {
 			return BadDecodingError
 		}
 		if err := dec.ReadString(&id); err != nil {
-			return BadDecodingError
+			return err
 		}
 		if ns == 0 && id == "" {
 			*value = nil
@@ -1021,7 +1052,7 @@ func (dec *BinaryDecoder) ReadNodeID(value *NodeID) error {
 			return BadDecodingError
 		}
 		if err := dec.ReadByteString(&id); err != nil {
-			return BadDecodingError
+			return err
 		}
 		if ns == 0 && id == "" {
 			*value = nil
@@ -1085,7 +1116,7 @@ func (dec *BinaryDecoder) ReadExpandedNodeID(value *ExpandedNodeID) error {
 		}
 		var id string
 		if err := dec.ReadString(&id); err != nil {
-			return BadDecodingError
+			return err
 		}
 		n = NewNodeIDString(ns, id)
 
@@ -1107,7 +1138,7 @@ func (dec *BinaryDecoder) ReadExpandedNodeID(value *ExpandedNodeID) error {
 		}
 		var id ByteString
 		if err := dec.ReadByteString(&id); err != nil {
-			return BadDecodingError
+			return err
 		}
 		n = NewNodeIDOpaque(ns, id)
 
@@ -1117,7 +1148,7 @@ func (dec *BinaryDecoder) ReadExpandedNodeID(value *ExpandedNodeID) error {
 
 	if (b & 0x80) != 0 {
 		if err := dec.ReadString(&nsu); err != nil {
-			return BadDecodingError
+			return err
 		}
 	}
 
@@ -1173,7 +1204,7 @@ func (dec *BinaryDecoder) ReadQualifiedName(value *QualifiedName) error {
 		return BadDecodingError
 	}
 	if err := dec.ReadString(&name); err != nil {
-		return BadDecodingError
+		return err
 	}
 	*value = QualifiedName{ns, name}
 	return nil
@@ -1191,12 +1222,12 @@ func (dec *BinaryDecoder) ReadLocalizedText(value *LocalizedText) error {
 	}
 	if (b & 1) != 0 {
 		if err := dec.ReadString(&locale); err != nil {
-			return BadDecodingError
+			return err
 		}
 	}
 	if (b & 2) != 0 {
 		if err := dec.ReadString(&text); err != nil {
-			return BadDecodingError
+			return err
 		}
 	}
 	*value = LocalizedText{text, locale}

@@ -163,6 +163,71 @@ func TestDecodeMemoryLimitErrors(t *testing.T) {
 	}
 }
 
+func TestDecodeMemoryLimitIsStrict(t *testing.T) {
+	// a limit is not exceeded by memory allocated before elements are decoded, even
+	// if the length of the input is unknown.
+	ec := limitsContext{ua.DecodingLimits{MaxMemory: 1}}
+	for kind, r := range readerKinds(cat(le32(0x7FFFFFFF), make([]byte, 64))) {
+		err, allocated := decodeWithStats(t, r, ec, func(dec *ua.BinaryDecoder) error {
+			var v []ua.DataValue
+			return dec.ReadDataValueArray(&v)
+		})
+		if kind != "opaque" {
+			// the array is longer than the input.
+			continue
+		}
+		if !errors.Is(err, ua.BadEncodingLimitsExceeded) {
+			t.Fatalf("%s: expected BadEncodingLimitsExceeded, got %v", kind, err)
+		}
+		if allocated > 16<<10 {
+			t.Fatalf("%s: decoder allocated %d bytes", kind, allocated)
+		}
+	}
+	for kind, r := range readerKinds(cat(le32(0x7FFFFFFF), make([]byte, 64))) {
+		err, allocated := decodeWithStats(t, r, ec, func(dec *ua.BinaryDecoder) error {
+			var v []ua.ReadValueID
+			return dec.Decode(&v)
+		})
+		if kind != "opaque" {
+			continue
+		}
+		if !errors.Is(err, ua.BadEncodingLimitsExceeded) {
+			t.Fatalf("%s: expected BadEncodingLimitsExceeded, got %v", kind, err)
+		}
+		if allocated > 16<<10 {
+			t.Fatalf("%s: decoder allocated %d bytes", kind, allocated)
+		}
+	}
+}
+
+func TestDecodeMemoryLimitErrorsOfCompositeValues(t *testing.T) {
+	// values that contain Strings or ByteStrings report the limit being exceeded.
+	ec := limitsContext{ua.DecodingLimits{MaxMemory: 1}}
+	str := cat(le32(2), []byte("xx"))
+	cases := map[string]struct {
+		input  []byte
+		decode func(*ua.BinaryDecoder) error
+	}{
+		"string NodeID":         {cat([]byte{0x03, 0x00, 0x00}, str), func(dec *ua.BinaryDecoder) error { var v ua.NodeID; return dec.ReadNodeID(&v) }},
+		"opaque NodeID":         {cat([]byte{0x05, 0x00, 0x00}, str), func(dec *ua.BinaryDecoder) error { var v ua.NodeID; return dec.ReadNodeID(&v) }},
+		"string ExpandedNodeID": {cat([]byte{0x03, 0x00, 0x00}, str), func(dec *ua.BinaryDecoder) error { var v ua.ExpandedNodeID; return dec.ReadExpandedNodeID(&v) }},
+		"namespace URI":         {cat([]byte{0x80, 0x01}, str), func(dec *ua.BinaryDecoder) error { var v ua.ExpandedNodeID; return dec.ReadExpandedNodeID(&v) }},
+		"QualifiedName":         {cat([]byte{0x00, 0x00}, str), func(dec *ua.BinaryDecoder) error { var v ua.QualifiedName; return dec.ReadQualifiedName(&v) }},
+		"LocalizedText locale":  {cat([]byte{0x01}, str), func(dec *ua.BinaryDecoder) error { var v ua.LocalizedText; return dec.ReadLocalizedText(&v) }},
+		"LocalizedText text":    {cat([]byte{0x02}, str), func(dec *ua.BinaryDecoder) error { var v ua.LocalizedText; return dec.ReadLocalizedText(&v) }},
+		"XMLElement":            {str, func(dec *ua.BinaryDecoder) error { var v ua.XMLElement; return dec.ReadXMLElement(&v) }},
+		"ByteArray":             {str, func(dec *ua.BinaryDecoder) error { var v []byte; return dec.ReadByteArray(&v) }},
+	}
+	for name, c := range cases {
+		for kind, r := range readerKinds(c.input) {
+			dec := ua.NewBinaryDecoder(r, ec)
+			if err := c.decode(dec); !errors.Is(err, ua.BadEncodingLimitsExceeded) {
+				t.Fatalf("%s/%s: expected BadEncodingLimitsExceeded, got %v", name, kind, err)
+			}
+		}
+	}
+}
+
 func TestDecodeMemoryLimitAllowsRealisticMessages(t *testing.T) {
 	now := time.Date(2026, time.October, 1, 12, 0, 0, 0, time.UTC)
 	values := func(n int, f func(i int) ua.DataValue) []ua.DataValue {
