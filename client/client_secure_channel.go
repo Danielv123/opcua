@@ -189,8 +189,8 @@ func newClientSecureChannel(
 		trace:                                trace,
 	}
 	if certs, err := x509.ParseCertificates(ch.remoteCertificate); err == nil && len(certs) > 0 {
-		// the key remains nil if the certificate does not hold a supported RSA key.
-		ch.remotePublicKey, _ = securechannel.RSAPublicKey(certs[0])
+		// the key remains nil if the certificate does not hold an RSA key allowed by the security policy.
+		ch.remotePublicKey, _ = securechannel.RSAPublicKey(certs[0], securityPolicyURI)
 		ch.remoteThumbprint = sha1.Sum(certs[0].Raw)
 	}
 	return ch
@@ -428,6 +428,10 @@ func (ch *clientSecureChannel) Open(ctx context.Context) error {
 	case ua.MessageSecurityModeSignAndEncrypt, ua.MessageSecurityModeSign:
 		if ch.localPrivateKey == nil {
 			return ua.BadSecurityChecksFailed
+		}
+		// the client certificate must hold a key that is long enough for the security policy.
+		if err := securechannel.CheckRSAKey(&ch.localPrivateKey.PublicKey, ch.securityPolicyURI); err != nil {
+			return err
 		}
 		ch.localPrivateKeySize = ch.localPrivateKey.Size()
 		if ch.remotePublicKey == nil {

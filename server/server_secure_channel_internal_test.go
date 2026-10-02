@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/awcullen/opcua/internal/securechannel"
 	"github.com/awcullen/opcua/internal/securechannel/securechanneltest"
 	"github.com/awcullen/opcua/ua"
 )
@@ -29,6 +30,8 @@ var (
 	testServer          testCredential // 2048 bit
 	testServerLarge     testCredential // 3072 bit, needs the extra padding byte
 	testOtherClient     testCredential // 2048 bit
+	testShortClient     testCredential // 1024 bit, too short for policies after Basic256
+	testShortServer     testCredential // 1024 bit, too short for policies after Basic256
 	testECDSACert       []byte
 	testEd25519Cert     []byte
 	testSmallRSACert    []byte // 512 bit
@@ -52,6 +55,8 @@ func loadTestCredentials(t *testing.T) {
 		testServer = newCredential("urn:localhost:testserver", 2048)
 		testServerLarge = newCredential("urn:localhost:testserverlarge", 3072)
 		testOtherClient = newCredential("urn:localhost:otherclient", 2048)
+		testShortClient = newCredential("urn:localhost:shortclient", 1024)
+		testShortServer = newCredential("urn:localhost:shortserver", 1024)
 
 		ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
@@ -213,6 +218,54 @@ func TestServerRejectsUnsupportedCertificate(t *testing.T) {
 			}
 			if ch.remotePublicKey != nil {
 				t.Error("remote public key was set")
+			}
+		})
+	}
+}
+
+// TestServerRejectsShortClientKey checks that a client certificate with a key shorter than the security
+// policy allows is rejected: 1024 bit keys are allowed for Basic128Rsa15 and Basic256 only.
+func TestServerRejectsShortClientKey(t *testing.T) {
+	loadTestCredentials(t)
+	for _, p := range testRSAPolicies {
+		t.Run(p.uri[len("http://opcfoundation.org/UA/SecurityPolicy#"):], func(t *testing.T) {
+			allowed := securechannel.MinRSAKeyLength(p.uri) <= 1024
+			ch, peer := newTestServerChannel(t, testServer)
+			_, _, err := readTestRequest(t, ch, peer, mustEncode(t, testOpenChunk(p, testShortClient, testServer, 1)))
+			if allowed && err != nil {
+				t.Fatalf("readRequest() = %v, want success", err)
+			}
+			if !allowed && err != ua.BadCertificatePolicyCheckFailed {
+				t.Fatalf("readRequest() = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
+			}
+
+			// the whole handshake.
+			ch, peer = newTestServerChannel(t, testServer)
+			err = openTestChannel(t, ch, peer, mustEncode(t, testOpenChunk(p, testShortClient, testServer, 1)))
+			if allowed && err != nil {
+				t.Fatalf("Open() = %v, want success", err)
+			}
+			if !allowed && err != ua.BadCertificatePolicyCheckFailed {
+				t.Fatalf("Open() = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
+			}
+		})
+	}
+}
+
+// TestServerRejectsPolicyForShortServerKey checks that a server whose certificate holds a key shorter
+// than a security policy requires rejects channels with that policy, instead of providing a weaker channel.
+func TestServerRejectsPolicyForShortServerKey(t *testing.T) {
+	loadTestCredentials(t)
+	for _, p := range testRSAPolicies {
+		t.Run(p.uri[len("http://opcfoundation.org/UA/SecurityPolicy#"):], func(t *testing.T) {
+			allowed := securechannel.MinRSAKeyLength(p.uri) <= 1024
+			ch, peer := newTestServerChannel(t, testShortServer)
+			_, _, err := readTestRequest(t, ch, peer, mustEncode(t, testOpenChunk(p, testClient, testShortServer, 1)))
+			if allowed && err != nil {
+				t.Fatalf("readRequest() = %v, want success", err)
+			}
+			if !allowed && err != ua.BadSecurityPolicyRejected {
+				t.Fatalf("readRequest() = %v, want %v", err, ua.BadSecurityPolicyRejected)
 			}
 		})
 	}

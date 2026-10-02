@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/awcullen/opcua/internal/securechannel"
 	"github.com/awcullen/opcua/internal/securechannel/securechanneltest"
 	"github.com/awcullen/opcua/ua"
 )
@@ -31,6 +32,8 @@ var (
 	testServer          testCredential // 2048 bit
 	testClientLarge     testCredential // 3072 bit, needs the extra padding byte
 	testOtherServer     testCredential // 2048 bit
+	testShortClient     testCredential // 1024 bit, too short for policies after Basic256
+	testShortServer     testCredential // 1024 bit, too short for policies after Basic256
 	testECDSACert       []byte
 	testEd25519Cert     []byte
 	testSmallRSACert    []byte // 512 bit
@@ -54,6 +57,8 @@ func loadTestCredentials(t *testing.T) {
 		testServer = newCredential("urn:localhost:testserver", 2048)
 		testClientLarge = newCredential("urn:localhost:testclientlarge", 3072)
 		testOtherServer = newCredential("urn:localhost:otherserver", 2048)
+		testShortClient = newCredential("urn:localhost:shortclient", 1024)
+		testShortServer = newCredential("urn:localhost:shortserver", 1024)
 
 		ecdsaKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 		if err != nil {
@@ -156,6 +161,49 @@ func TestClientRejectsUnsupportedCertificate(t *testing.T) {
 			}
 			if ch.conn != nil {
 				ch.conn.Close()
+			}
+		})
+	}
+}
+
+// TestClientRejectsShortKeys checks that a server certificate, or a client certificate, with a key shorter
+// than the security policy allows is rejected: 1024 bit keys are allowed for Basic128Rsa15 and Basic256 only.
+func TestClientRejectsShortKeys(t *testing.T) {
+	loadTestCredentials(t)
+	endpointURL := listenAcknowledge(t)
+	for _, p := range testRSAPolicies {
+		t.Run(p.uri[len("http://opcfoundation.org/UA/SecurityPolicy#"):], func(t *testing.T) {
+			allowed := securechannel.MinRSAKeyLength(p.uri) <= 1024
+			open := func(client testCredential, serverCert []byte) error {
+				ch := newTestClientSecureChannel(endpointURL, p.uri, ua.MessageSecurityModeSignAndEncrypt, client, serverCert)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				err := ch.Open(ctx)
+				if ch.conn != nil {
+					ch.conn.Close()
+				}
+				return err
+			}
+
+			// server certificate
+			ch := newTestClientSecureChannel(endpointURL, p.uri, ua.MessageSecurityModeSignAndEncrypt, testClient, testShortServer.cert)
+			if allowed && ch.remotePublicKey == nil {
+				t.Error("1024 bit server key was rejected")
+			}
+			if !allowed {
+				if ch.remotePublicKey != nil {
+					t.Error("1024 bit server key was accepted")
+				}
+				if err := open(testClient, testShortServer.cert); err != ua.BadSecurityChecksFailed {
+					t.Errorf("Open() with a 1024 bit server key = %v, want %v", err, ua.BadSecurityChecksFailed)
+				}
+			}
+
+			// client certificate
+			if !allowed {
+				if err := open(testShortClient, testServer.cert); err != ua.BadCertificatePolicyCheckFailed {
+					t.Errorf("Open() with a 1024 bit client key = %v, want %v", err, ua.BadCertificatePolicyCheckFailed)
+				}
 			}
 		})
 	}

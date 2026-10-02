@@ -346,7 +346,7 @@ func (ch *serverSecureChannel) Open() error {
 			return err
 		}
 		cert := certs[0]
-		remotePublicKey, err := securechannel.RSAPublicKey(cert)
+		remotePublicKey, err := securechannel.RSAPublicKey(cert, ch.securityPolicyURI)
 		if err != nil {
 			return err
 		}
@@ -1285,13 +1285,19 @@ func (ch *serverSecureChannel) readRequest() (ua.ServiceRequest, uint32, error) 
 					return nil, 0, ua.BadSecurityChecksFailed
 				}
 
+				// the server cannot provide a security policy that requires a longer key than its own.
+				if err := securechannel.CheckRSAKey(&ch.localPrivateKey.PublicKey, ch.securityPolicyURI); err != nil {
+					log.Printf("Error opening secure channel. The key of the server certificate is too short for security policy %s.\n", ch.securityPolicyURI)
+					return nil, 0, ua.BadSecurityPolicyRejected
+				}
+
 				if ch.remoteCertificate == nil {
 					return nil, 0, ua.BadSecurityChecksFailed
 				}
 
 				// the certificate is validated against the trust list only later (in Open), so check
-				// that it holds a supported RSA key before any RSA operation.
-				remotePublicKey, err := securechannel.ParseRSAPublicKey(ch.remoteCertificate)
+				// that it holds an RSA key allowed by the security policy before any RSA operation.
+				remotePublicKey, err := securechannel.ParseRSAPublicKey(ch.remoteCertificate, ch.securityPolicyURI)
 				if err != nil {
 					return nil, 0, err
 				}
